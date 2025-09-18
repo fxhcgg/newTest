@@ -3,36 +3,78 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Three.js + WebXR AR & 摄像头示例</title>
+  <title>Three.js + WebXR AR & 兼容回退（含自检）</title>
   <style>
     html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#000; }
-    #ui { position:fixed; z-index:10; left:12px; bottom:12px; display:flex; gap:8px; flex-wrap:wrap; }
-    .btn { appearance:none; border:none; padding:10px 14px; border-radius:12px; font-size:14px; font-weight:600; cursor:pointer; }
-    .btn.primary { background:#4f46e5; color:white; }
-    .btn { background:#ffffffcc; }
-    #cameraOnly { position:fixed; inset:0; display:none; background:#000; }
-    #cameraOnly video { width:100%; height:100%; object-fit:cover; }
-    #hint { position:fixed; top:12px; left:50%; transform:translateX(-50%); color:white; background:rgba(0,0,0,.4); padding:8px 12px; border-radius:999px; font-family:system-ui, -apple-system, Segoe UI, Roboto, Noto Sans, Helvetica, Arial; }
     canvas { display:block; }
+    #ui { position:fixed; z-index:20; left:12px; bottom:12px; display:flex; gap:8px; flex-wrap:wrap; }
+    .btn { appearance:none; border:none; padding:10px 14px; border-radius:12px; font-size:14px; font-weight:600; cursor:pointer; background:#ffffffcc; }
+    .btn.primary { background:#4f46e5; color:#fff; }
+    #hint { position:fixed; top:12px; left:50%; transform:translateX(-50%); color:white; background:rgba(0,0,0,.4); padding:8px 12px; border-radius:999px; font-family:system-ui, -apple-system, Segoe UI, Roboto, Noto Sans, Helvetica, Arial; z-index:20; }
+    #cameraOnly { position:fixed; inset:0; display:none; background:#000; z-index:10; }
+    #cameraOnly video { width:100%; height:100%; object-fit:cover; }
+
+    /* 兼容层（<model-viewer>）全屏覆盖 */
+    #mvWrap { position:fixed; inset:0; display:none; background:#000; z-index:15; }
+    #mvWrap model-viewer { width:100%; height:100%; }
+
+    /* 诊断面板 */
+    #diag { position:fixed; right:12px; bottom:12px; z-index:30; max-width:360px; }
+    #diag details { background:#111a; color:#fff; border-radius:12px; padding:8px 10px; }
+    #diag summary { cursor:pointer; font-weight:700; }
+    #diag pre { white-space:pre-wrap; margin:6px 0 0; font-size:12px; }
+    .ok { color:#34d399; }
+    .warn { color:#fbbf24; }
+    .err { color:#f87171; }
   </style>
+
+  <!-- model-viewer 作为通用 AR 回退（Android: Scene Viewer, iOS: Quick Look） -->
+  <script type="module" src="https://unpkg.com/@google/model-viewer@3.5.0/dist/model-viewer.min.js"></script>
 </head>
 <body>
   <div id="hint">在平面上移动设备以检测可放置区域，然后点按放置立方体。</div>
+
   <div id="ui">
     <button class="btn primary" id="enterAr">进入 AR（WebXR）</button>
+    <button class="btn" id="enterCompat">通用 AR（兼容）</button>
     <button class="btn" id="openCam">仅开启摄像头</button>
     <button class="btn" id="closeCam" style="display:none;">关闭摄像头</button>
+    <button class="btn" id="runDiag">自检</button>
   </div>
+
   <div id="cameraOnly">
     <video id="video" playsinline autoplay muted></video>
   </div>
 
-  <script type="module">
-    // ===== 依赖 =====
-    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
-    import { ARButton } from 'https://unpkg.com/three@0.160.0/examples/jsm/webxr/ARButton.js';
+  <!-- 通用 AR 兼容层：当 WebXR 不可用或手动触发时展示 -->
+  <div id="mvWrap">
+    <!-- 为避免 “GLTFLoader: Couldn't load texture”，这里选用 **内嵌贴图** 的 GLB；
+         iOS 使用苹果官方 USDZ 示例。都支持跨站访问，并加了 crossorigin。 -->
+    <model-viewer id="mv"
+      src="https://threejs.org/examples/models/gltf/DamagedHelmet/glTF-Binary/DamagedHelmet.glb"
+      ios-src="https://developer.apple.com/augmented-reality/quick-look/models/teapot/teapot.usdz"
+      ar ar-modes="webxr scene-viewer quick-look"
+      camera-controls autoplay
+      exposure="1.0"
+      shadow-intensity="1"
+      environment-image="neutral"
+      style="background:#000"
+      crossorigin="anonymous">
+    </model-viewer>
+  </div>
 
-    // ===== 基础 Three.js 场景 =====
+  <div id="diag">
+    <details>
+      <summary>诊断结果 / Tests（点击展开）</summary>
+      <pre id="diagLog">尚未运行自检。</pre>
+    </details>
+  </div>
+
+  <script type="module">
+    // ===== Three.js 依赖 =====
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+
+    // ===== 基础 Three.js 场景（WebXR） =====
     const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(window.innerWidth, window.innerHeight);
@@ -42,7 +84,7 @@
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera();
 
-    // 柔和环境光，放置后能看清模型
+    // 柔和环境光
     const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1.0);
     scene.add(light);
 
@@ -70,11 +112,18 @@
     const enterArBtn = document.querySelector('#enterAr');
     enterArBtn.addEventListener('click', async () => {
       if (!navigator.xr) {
-        alert('此浏览器不支持 WebXR。可点击“仅开启摄像头”。\n建议使用最新版的 Chrome/Edge（需 HTTPS 与支持 AR 的设备）。');
+        alert('此浏览器不支持 WebXR。可尝试“通用 AR（兼容）”或“仅开启摄像头”。');
         return;
       }
 
       try {
+        const supported = await navigator.xr.isSessionSupported('immersive-ar');
+        if (!supported) {
+          alert('检测到不支持 immersive-ar，会自动切换到通用 AR。');
+          showCompat();
+          return;
+        }
+
         const session = await navigator.xr.requestSession('immersive-ar', {
           requiredFeatures: ['hit-test', 'dom-overlay'],
           domOverlay: { root: document.body }
@@ -111,6 +160,16 @@
         alert('启动 AR 失败：' + err);
       }
     });
+
+    // 渐进增强：手动进入兼容 AR
+    document.getElementById('enterCompat').addEventListener('click', showCompat);
+    function showCompat() {
+      document.getElementById('mvWrap').style.display = 'block';
+      const btn = document.getElementById('enterAr');
+      if (btn) { btn.disabled = true; btn.textContent = 'AR（WebXR 不可用/已切换）'; }
+      const hint = document.getElementById('hint');
+      if (hint) hint.textContent = '已切换到通用 AR。点击右下角“在你的空间中查看”进入。';
+    }
 
     // 每帧：做 hit test 来更新 reticle
     const clock = new THREE.Clock();
@@ -172,12 +231,100 @@
     window.addEventListener('resize', () => {
       renderer.setSize(window.innerWidth, window.innerHeight);
     });
-  </script>
 
-  <!-- 使用须知：
-    1) 必须在 HTTPS 下打开（或 localhost），并使用支持 WebXR AR 的移动浏览器（如 Android Chrome + ARCore）。
-    2) 点击“进入 AR”后，移动设备让摄像头对着地面等平面区域，出现绿色光环后点按屏幕进行放置。
-    3) 如果设备/浏览器不支持 WebXR，可用“仅开启摄像头”作为演示回退（无空间追踪）。
-  -->
+    // ====== 兼容检测：首屏若不支持 WebXR 的 immersive-ar，则提示并提供回退 ======
+    (async () => {
+      let support = false;
+      try {
+        support = !!(navigator.xr && (await navigator.xr.isSessionSupported('immersive-ar')));
+      } catch (e) { support = false; }
+      if (!support) {
+        // 不直接弹出，提示用户可用“通用 AR”
+        const btn = document.getElementById('enterAr');
+        if (btn) { btn.title = '设备/浏览器不支持 WebXR AR'; }
+      }
+    })();
+
+    // ====== 监听 model-viewer 错误，给出可读提示 ======
+    const mv = document.getElementById('mv');
+    mv?.addEventListener('error', (ev) => {
+      const err = ev?.detail?.message || '未知错误';
+      console.warn('[model-viewer error]', err);
+      log(`model-viewer 加载错误：${err}\n` +
+          '如果看到 “GLTFLoader: Couldn\'t load texture”，通常是贴图跨域或资源路径问题。\n' +
+          '本示例已改用内嵌贴图的 GLB 与官方 USDZ，如仍报错，请检查网络或企业代理。', 'err');
+    });
+
+    // ===== 诊断 / Tests =====
+    const diagLog = document.getElementById('diagLog');
+    function log(msg, level='') {
+      const prefix = level==='err' ? '❌ ' : level==='ok' ? '✅ ' : level==='warn' ? '⚠️ ' : '';
+      diagLog.textContent += `${prefix}${msg}\n`;
+    }
+
+    async function head(url) {
+      try {
+        const res = await fetch(url, { method: 'HEAD' });
+        if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+        return true;
+      } catch (e) {
+        // 有些服务器不支持 HEAD，再做 GET range 0
+        try {
+          const res = await fetch(url, { method: 'GET', headers: { 'Range': 'bytes=0-0' } });
+          if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+          return true;
+        } catch (e2) { return false; }
+      }
+    }
+
+    async function runDiagnostics() {
+      diagLog.textContent = '';
+      log('=== 基础环境 ===');
+      log(`页面协议：${location.protocol}`);
+      log(`UserAgent: ${navigator.userAgent}`);
+
+      const httpsOk = location.protocol === 'https:' || location.hostname === 'localhost';
+      log(httpsOk ? '已在 HTTPS/localhost 下运行。' : '非 HTTPS 环境，摄像头/AR 可能被浏览器拦截。', httpsOk ? 'ok' : 'warn');
+
+      const xrAvail = !!navigator.xr;
+      log(`navigator.xr 可用：${xrAvail}`, xrAvail ? 'ok' : 'warn');
+      let xrImm = false;
+      try { xrImm = !!(navigator.xr && await navigator.xr.isSessionSupported('immersive-ar')); } catch(e) {}
+      log(`immersive-ar 支持：${xrImm}`, xrImm ? 'ok' : 'warn');
+
+      log('\n=== 资源可达性（测试用例）===');
+      const glbUrl = mv.getAttribute('src');
+      const usdzUrl = mv.getAttribute('ios-src');
+      const glbOk = await head(glbUrl);
+      log(`GLB 可访问：${glbOk} → ${glbUrl}`, glbOk ? 'ok' : 'err');
+      const usdzOk = await head(usdzUrl);
+      log(`USDZ 可访问：${usdzOk} → ${usdzUrl}`, usdzOk ? 'ok' : 'warn');
+
+      log('\n=== 摄像头权限（测试用例）===');
+      try {
+        const perm = await navigator.permissions?.query?.({ name: 'camera' });
+        if (perm) {
+          log(`camera 权限状态：${perm.state}`);
+        }
+      } catch(_) {}
+
+      log('\n=== 结论 ===');
+      if (!glbOk) {
+        log('GLB 无法访问：请检查网络、CORS 或替换为同源/可达模型。', 'err');
+      } else {
+        log('GLB 访问正常（贴图已内嵌，理论上不会再出现纹理加载失败）。', 'ok');
+      }
+    }
+
+    document.getElementById('runDiag').addEventListener('click', runDiagnostics);
+
+    // 捕获全局错误，提示排查方向
+    window.addEventListener('error', (e) => {
+      log(`窗口错误：${e.message}`, 'err');
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      log(`未捕获 Promise 拒绝：${e.reason}`, 'err');
+    });
+  </script>
 </body>
 </html>
