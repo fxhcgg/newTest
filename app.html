@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Three.js + WebXR AR & 摄像头示例</title>
+  <style>
+    html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#000; }
+    #ui { position:fixed; z-index:10; left:12px; bottom:12px; display:flex; gap:8px; flex-wrap:wrap; }
+    .btn { appearance:none; border:none; padding:10px 14px; border-radius:12px; font-size:14px; font-weight:600; cursor:pointer; }
+    .btn.primary { background:#4f46e5; color:white; }
+    .btn { background:#ffffffcc; }
+    #cameraOnly { position:fixed; inset:0; display:none; background:#000; }
+    #cameraOnly video { width:100%; height:100%; object-fit:cover; }
+    #hint { position:fixed; top:12px; left:50%; transform:translateX(-50%); color:white; background:rgba(0,0,0,.4); padding:8px 12px; border-radius:999px; font-family:system-ui, -apple-system, Segoe UI, Roboto, Noto Sans, Helvetica, Arial; }
+    canvas { display:block; }
+  </style>
+</head>
+<body>
+  <div id="hint">在平面上移动设备以检测可放置区域，然后点按放置立方体。</div>
+  <div id="ui">
+    <button class="btn primary" id="enterAr">进入 AR（WebXR）</button>
+    <button class="btn" id="openCam">仅开启摄像头</button>
+    <button class="btn" id="closeCam" style="display:none;">关闭摄像头</button>
+  </div>
+  <div id="cameraOnly">
+    <video id="video" playsinline autoplay muted></video>
+  </div>
+
+  <script type="module">
+    // ===== 依赖 =====
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { ARButton } from 'https://unpkg.com/three@0.160.0/examples/jsm/webxr/ARButton.js';
+
+    // ===== 基础 Three.js 场景 =====
+    const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true; // 开启 WebXR
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera();
+
+    // 柔和环境光，放置后能看清模型
+    const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1.0);
+    scene.add(light);
+
+    // 待放置的模型（一个有边框的彩色立方体）
+    const group = new THREE.Group();
+    const cubeGeo = new THREE.BoxGeometry(0.1, 0.1, 0.1);
+    const cubeMat = new THREE.MeshStandardMaterial({ color: 0x4f46e5, metalness: 0.2, roughness: 0.6 });
+    const cube = new THREE.Mesh(cubeGeo, cubeMat);
+    const edges = new THREE.LineSegments(new THREE.EdgesGeometry(cubeGeo), new THREE.LineBasicMaterial({ color: 0xffffff }));
+    group.add(cube, edges);
+
+    // 命中光标（环形网格）
+    const reticle = new THREE.Mesh(
+      new THREE.RingGeometry(0.08, 0.1, 32).rotateX(-Math.PI / 2),
+      new THREE.MeshBasicMaterial({ color: 0x00ff88 })
+    );
+    reticle.matrixAutoUpdate = false;
+    reticle.visible = false;
+    scene.add(reticle);
+
+    // ===== WebXR AR 相关 =====
+    let xrHitTestSource = null;
+    let xrRefSpace = null;
+
+    const enterArBtn = document.querySelector('#enterAr');
+    enterArBtn.addEventListener('click', async () => {
+      if (!navigator.xr) {
+        alert('此浏览器不支持 WebXR。可点击“仅开启摄像头”。\n建议使用最新版的 Chrome/Edge（需 HTTPS 与支持 AR 的设备）。');
+        return;
+      }
+
+      try {
+        const session = await navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['hit-test', 'dom-overlay'],
+          domOverlay: { root: document.body }
+        });
+        renderer.xr.setReferenceSpaceType('local');
+        await renderer.xr.setSession(session);
+
+        // 会话开始时创建 hit test source
+        const viewerSpace = await session.requestReferenceSpace('viewer');
+        xrRefSpace = await session.requestReferenceSpace('local');
+        xrHitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+
+        // 选择事件：将立方体放到 reticle 处
+        const controller = renderer.xr.getController(0);
+        controller.addEventListener('select', () => {
+          if (reticle.visible) {
+            group.position.setFromMatrixPosition(reticle.matrix);
+            group.quaternion.setFromRotationMatrix(reticle.matrix);
+            scene.add(group);
+          }
+        });
+        scene.add(controller);
+
+        // 结束时清理
+        session.addEventListener('end', () => {
+          xrHitTestSource = null;
+          xrRefSpace = null;
+          reticle.visible = false;
+        });
+
+        animate();
+      } catch (err) {
+        console.error(err);
+        alert('启动 AR 失败：' + err);
+      }
+    });
+
+    // 每帧：做 hit test 来更新 reticle
+    const clock = new THREE.Clock();
+    function animate() {
+      renderer.setAnimationLoop((timestamp, frame) => {
+        if (frame) {
+          const referenceSpace = xrRefSpace;
+          const hitTestSource = xrHitTestSource;
+          if (referenceSpace && hitTestSource) {
+            const hitTestResults = frame.getHitTestResults(hitTestSource);
+            if (hitTestResults.length > 0) {
+              const pose = hitTestResults[0].getPose(referenceSpace);
+              reticle.visible = true;
+              reticle.matrix.fromArray(pose.transform.matrix);
+            } else {
+              reticle.visible = false;
+            }
+          }
+        }
+
+        // 简单动画：放置后让立方体轻微旋转
+        if (group.parent) {
+          const t = clock.getElapsedTime();
+          group.rotation.y = t * 0.6;
+        }
+
+        renderer.render(scene, camera);
+      });
+    }
+
+    // ===== 仅调用摄像头（非 AR 回退） =====
+    const video = document.getElementById('video');
+    const cameraOnly = document.getElementById('cameraOnly');
+    const openCamBtn = document.getElementById('openCam');
+    const closeCamBtn = document.getElementById('closeCam');
+    let mediaStream = null;
+
+    openCamBtn.addEventListener('click', async () => {
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+        video.srcObject = mediaStream;
+        cameraOnly.style.display = 'block';
+        closeCamBtn.style.display = 'inline-block';
+      } catch (e) {
+        alert('开启摄像头失败：' + e.message + '\n请确保 HTTPS 与权限已允许。');
+      }
+    });
+
+    closeCamBtn.addEventListener('click', () => {
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(t => t.stop());
+        mediaStream = null;
+      }
+      cameraOnly.style.display = 'none';
+      closeCamBtn.style.display = 'none';
+    });
+
+    // 自适应视口
+    window.addEventListener('resize', () => {
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+
+  <!-- 使用须知：
+    1) 必须在 HTTPS 下打开（或 localhost），并使用支持 WebXR AR 的移动浏览器（如 Android Chrome + ARCore）。
+    2) 点击“进入 AR”后，移动设备让摄像头对着地面等平面区域，出现绿色光环后点按屏幕进行放置。
+    3) 如果设备/浏览器不支持 WebXR，可用“仅开启摄像头”作为演示回退（无空间追踪）。
+  -->
+</body>
+</html>
