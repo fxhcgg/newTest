@@ -14,6 +14,7 @@
     input[type="file"], button, textarea { font-size: 14px; }
     textarea { width: 100%; max-width: 680px; height: 120px; background: #111; color: #eee; border: 1px solid #333; border-radius: 8px; padding: 8px; }
     #overlay { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,.5); z-index: 9; }
+    canvas { touch-action: none; }
   </style>
 </head>
 <body>
@@ -26,12 +27,10 @@
   <div id="overlay"><textarea id="jsonText" placeholder="在这里粘贴 JSON，然后再次点“Start AR”"></textarea></div>
   <div id="log"></div>
 
-  <!-- Three.js & helpers（使用 ES modules） -->
   <script type="module">
     import * as THREE from 'https://unpkg.com/three@0.161.0/build/three.module.js';
-    import { ARButton } from 'https://unpkg.com/three@0.161.0/examples/jsm/webxr/ARButton.js';
 
-    // ========== UI refs ==========
+    // ---- UI refs ----
     const $file = document.getElementById('file');
     const $btnPaste = document.getElementById('btnPaste');
     const $btnUseSample = document.getElementById('btnUseSample');
@@ -40,83 +39,81 @@
     const $jsonText = document.getElementById('jsonText');
     const $log = document.getElementById('log');
 
-    // ========== state ==========
-    let jsonData = null;       // 解析后的 TraceJSON
-    let renderer, scene, camera, reticle, hitTestSource = null, hitTestSourceRequested = false;
+    // ---- state ----
+    let jsonData = null;         // 解析后的 TraceJSON
+    let renderer, scene, camera;
+    let reticle, root = new THREE.Group();
+    let xrSession = null;
+    let viewerSpace = null;
+    let xrRefSpace = null;       // 'local-floor'（若不可用回退 'local'）
+    let hitTestSource = null;
     let placed = false;
-    const root = new THREE.Group();  // 整条路径的根节点
 
-    // ========== helpers ==========
     const log = (...args) => { console.log(...args); $log.textContent = args.join(' '); };
 
+    // ---- JSON 解析 ----
     function parseTrace(obj) {
-      // 期望字段：steps[{ deltaYawDeg, strideEstM }], startPoseHint{face, landmark}
       if (!obj || !Array.isArray(obj.steps)) throw new Error('无效 JSON：缺少 steps[]');
       return obj;
     }
 
+    // ---- 构建路径 ----
     function buildPathFromSteps(trace) {
-      // 约定：初始朝向沿 +Z（面向“前方”），deltaYawDeg > 0 表示左转（逆时针）
       const g = new THREE.Group();
-      const pts = [];                 // 采样点序列
+      const pts = [];
       const arrows = new THREE.Group();
-      const lineMat = new THREE.LineBasicMaterial({ linewidth: 2 });
+      const lineMat = new THREE.LineBasicMaterial();
       const lineGeom = new THREE.BufferGeometry();
 
-      let theta = 0;                  // 累计朝向（弧度）
-      let x = 0, z = 0;               // 当前平面位置（米）
+      let theta = 0;  // 方向（弧度），初始面向 +Z
+      let x = 0, z = 0;
       pts.push(new THREE.Vector3(x, 0, z));
 
       for (const step of trace.steps) {
         const turnRad = (step.deltaYawDeg || 0) * Math.PI / 180.0;
         theta += turnRad;
 
-        const stride = step.strideEstM || 0.7;
-        // 朝向向量（沿平面，右手系，+Z 前）
+        const stride = step.strideEstM ?? 0.7;
         const dx = Math.sin(theta) * stride;
         const dz = Math.cos(theta) * stride;
 
         x += dx; z += dz;
         pts.push(new THREE.Vector3(x, 0, z));
 
-        // 每步一个箭头（小锥体+圆柱）
-        const stepGrp = new THREE.Group();
-        // 身体（圆柱）
+        // 每步箭头
+        const seg = new THREE.Group();
         const cyl = new THREE.Mesh(
           new THREE.CylinderGeometry(0.035, 0.035, stride * 0.85, 16),
           new THREE.MeshStandardMaterial({ metalness: 0.1, roughness: 0.6 })
         );
         cyl.rotation.x = Math.PI / 2;
         cyl.position.z = (stride * 0.85) / 2;
-        // 箭头（锥体）
         const cone = new THREE.Mesh(
           new THREE.ConeGeometry(0.07, 0.14, 16),
           new THREE.MeshStandardMaterial({ metalness: 0.1, roughness: 0.4 })
         );
         cone.position.z = stride * 0.85 + 0.07;
-
-        stepGrp.add(cyl, cone);
-        stepGrp.position.set(x - dx, 0.02, z - dz);   // 放在本步段起点
-        stepGrp.rotation.y = theta;
-        arrows.add(stepGrp);
+        seg.add(cyl, cone);
+        seg.position.set(x - dx, 0.02, z - dz);
+        seg.rotation.y = theta;
+        arrows.add(seg);
       }
 
-      // 把折线画出来
+      // 折线
       const linePoints = new Float32Array(pts.length * 3);
       pts.forEach((p, i) => { linePoints[3*i] = p.x; linePoints[3*i+1] = 0.01; linePoints[3*i+2] = p.z; });
       lineGeom.setAttribute('position', new THREE.BufferAttribute(linePoints, 3));
       const line = new THREE.Line(lineGeom, lineMat);
 
-      // 起点/终点标记
-      const startMarker = new THREE.Mesh(new THREE.TorusGeometry(0.15, 0.03, 12, 48),
+      // 起终点
+      const startMarker = new THREE.Mesh(new THREE.TorusGeometry(0.15, 0.03, 12, 48).rotateX(-Math.PI/2),
                                          new THREE.MeshStandardMaterial({ color: 0x00ff88 }));
-      startMarker.rotation.x = -Math.PI / 2;
       const endMarker = new THREE.Mesh(new THREE.SphereGeometry(0.08, 24, 16),
                                        new THREE.MeshStandardMaterial({ color: 0xffcc00 }));
       startMarker.position.copy(pts[0]).y = 0.02;
       endMarker.position.copy(pts[pts.length - 1]).y = 0.08;
 
-      // 标签（起点提示）
+      // 标签
       if (trace.startPoseHint && (trace.startPoseHint.face || trace.startPoseHint.landmark)) {
         const label = makeTextSprite(`${trace.startPoseHint.face || ''} ${trace.startPoseHint.landmark || ''}`.trim());
         label.position.copy(pts[0]); label.position.y = 0.25;
@@ -129,77 +126,63 @@
 
     function makeTextSprite(text) {
       const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
-      const font = 40;
       canvas.width = 1024; canvas.height = 256;
+      const ctx = canvas.getContext('2d');
       ctx.fillStyle = 'rgba(0,0,0,0)'; ctx.fillRect(0,0,canvas.width,canvas.height);
-      ctx.font = `700 ${font}px ui-sans-serif,Helvetica,Arial`;
-      ctx.textBaseline = 'middle';
-      ctx.textAlign = 'center';
-      ctx.fillStyle = '#ffffff';
-      ctx.strokeStyle = '#000000';
-      ctx.lineWidth = 10;
-      ctx.strokeText(text, canvas.width/2, canvas.height/2);
-      ctx.fillText(text, canvas.width/2, canvas.height/2);
+      ctx.font = `700 40px ui-sans-serif,Helvetica,Arial`;
+      ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
+      ctx.strokeStyle = '#000'; ctx.lineWidth = 10; ctx.strokeText(text, canvas.width/2, canvas.height/2);
+      ctx.fillStyle = '#fff'; ctx.fillText(text, canvas.width/2, canvas.height/2);
 
       const tex = new THREE.CanvasTexture(canvas);
       tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
-      const mat = new THREE.SpriteMaterial({ map: tex, transparent: true });
-      const sprite = new THREE.Sprite(mat);
+      const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true }));
       sprite.scale.set(0.8, 0.2, 1);
       return sprite;
     }
 
-    // ========== JSON 装载 ==========
+    // ---- 文件/按钮事件 ----
     $file.addEventListener('change', async (e) => {
-      const f = e.target.files?.[0];
-      if (!f) return;
-      const text = await f.text();
-      try { jsonData = parseTrace(JSON.parse(text)); log('已载入文件：', f.name); }
+      const f = e.target.files?.[0]; if (!f) return;
+      try { jsonData = parseTrace(JSON.parse(await f.text())); log('已载入：', f.name); }
       catch (err) { log('解析失败：', err.message); }
     });
-
     $btnPaste.addEventListener('click', () => { $overlay.style.display = 'flex'; });
-
     $btnUseSample.addEventListener('click', () => {
-      // 你上传的那份样例（精简了 keyEvents/annotations）：
-      const sample = {
-        "traceId":"D9D8321E-077D-4776-9085-F87E7F33BEE4",
+      jsonData = {
+        "traceId":"demo",
         "meta":{"createdAt":"2025-10-12T16:18:44Z","device":"iPhone/26.0","samplingHz":{"devMotion":100}},
         "startPoseHint":{"face":"面向大厅出口开始","landmark":"1楼前台"},
         "steps":[
-          {"i":0,"deltaYawDeg":-5.818610881088103,"strideEstM":0.72,"events":[]},
-          {"i":1,"deltaYawDeg":-3.08237800348029,"strideEstM":0.72,"events":[]},
-          {"i":2,"deltaYawDeg":-4.238486895693455,"strideEstM":0.72,"events":[]},
-          {"i":3,"deltaYawDeg": 2.351808205978312,"strideEstM":0.72,"events":[]},
-          {"i":4,"deltaYawDeg":-1.749029987610868,"strideEstM":0.72,"events":[]},
-          {"i":5,"deltaYawDeg": 1.2722277933856623,"strideEstM":0.72,"events":[]}
+          {"i":0,"deltaYawDeg":-5.8186108811,"strideEstM":0.72,"events":[]},
+          {"i":1,"deltaYawDeg":-3.0823780035,"strideEstM":0.72,"events":[]},
+          {"i":2,"deltaYawDeg":-4.2384868957,"strideEstM":0.72,"events":[]},
+          {"i":3,"deltaYawDeg": 2.3518082060,"strideEstM":0.72,"events":[]},
+          {"i":4,"deltaYawDeg":-1.7490299876,"strideEstM":0.72,"events":[]},
+          {"i":5,"deltaYawDeg": 1.2722277934,"strideEstM":0.72,"events":[]}
         ],
         "keyEvents":[],
         "annotations":[]
-      }; // 来源：你上传的 JSON（字段一致）:contentReference[oaicite:1]{index=1}
-      jsonData = sample;
+      };
       log('已载入内置样例。');
     });
 
-    $btnStart.addEventListener('click', () => {
-      if (!jsonData) {
-        // 支持从粘贴框读取
-        if ($overlay.style.display === 'flex' && $jsonText.value.trim().length) {
-          try { jsonData = parseTrace(JSON.parse($jsonText.value)); $overlay.style.display = 'none'; }
-          catch (e) { return log('粘贴 JSON 解析失败：', e.message); }
-        }
+    $btnStart.addEventListener('click', async () => {
+      // 允许从粘贴框读取
+      if (!jsonData && $overlay.style.display === 'flex' && $jsonText.value.trim()) {
+        try { jsonData = parseTrace(JSON.parse($jsonText.value)); $overlay.style.display = 'none'; }
+        catch (e) { return log('粘贴 JSON 解析失败：', e.message); }
       }
       if (!jsonData) return log('请先选择/粘贴 JSON。');
-      startAR();
+      try { await startAR(); } catch (e) { log('启动失败：', e.message || e); }
     });
 
-    // ========== AR 初始化 ==========
+    // ---- 启动 AR，会话先建立，再配置 hit-test ----
     async function startAR() {
-      if (!navigator.xr) return log('此设备/浏览器不支持 WebXR。请用支持 WebXR 的浏览器（HTTPS）。');
+      if (!navigator.xr) throw new Error('此设备/浏览器不支持 WebXR。请用 iOS 17+ Safari 且 HTTPS。');
 
       const supported = await navigator.xr.isSessionSupported?.('immersive-ar');
-      if (!supported) return log('不支持 immersive-ar 会话。');
+      if (!supported) throw new Error('不支持 immersive-ar 会话。');
 
       // Three 基础
       renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -211,88 +194,87 @@
       scene = new THREE.Scene();
       camera = new THREE.PerspectiveCamera();
 
-      // 灯光
       scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.0));
-      const dir = new THREE.DirectionalLight(0xffffff, 0.6);
-      dir.position.set(1, 2, 1); scene.add(dir);
+      const dir = new THREE.DirectionalLight(0xffffff, 0.6); dir.position.set(1,2,1); scene.add(dir);
 
-      // 准星（reticle）
       reticle = new THREE.Mesh(
         new THREE.RingGeometry(0.15, 0.18, 32).rotateX(-Math.PI/2),
         new THREE.MeshBasicMaterial({ color: 0x00ffaa })
       );
-      reticle.matrixAutoUpdate = false;
-      reticle.visible = false;
-      scene.add(reticle);
+      reticle.matrixAutoUpdate = false; reticle.visible = false; scene.add(reticle);
 
-      // 把路径（先在原点构建）：
+      // 构建路径（先放原点，等放置后整体移动/旋转）
       root.clear();
       const pathObj = buildPathFromSteps(jsonData);
-      // 把路径整体抬一点，避免穿地
       pathObj.position.y = 0.02;
       root.add(pathObj);
-      scene.add(root);
       root.visible = false;
+      scene.add(root);
 
-      // AR 按钮（可选）
-      document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['hit-test'] }));
+      // 申请会话
+      xrSession = await navigator.xr.requestSession('immersive-ar', {
+        requiredFeatures: ['hit-test'],
+        optionalFeatures: ['local-floor', 'anchors']
+      });
 
-      // 点击放置
+      // three.js 绑定会话
+      await renderer.xr.setSession(xrSession);
+
+      // 在会话真正开始时，再申请 reference space 与 hit-test source
+      renderer.xr.addEventListener('sessionstart', async () => {
+        try {
+          viewerSpace = await xrSession.requestReferenceSpace('viewer');
+          // local-floor 在有些设备不可用，回退 local
+          try { xrRefSpace = await xrSession.requestReferenceSpace('local-floor'); }
+          catch { xrRefSpace = await xrSession.requestReferenceSpace('local'); }
+          hitTestSource = await xrSession.requestHitTestSource({ space: viewerSpace });
+          log('XR 会话已就绪，轻点地面放置路径。');
+        } catch (e) {
+          log('XR 会话初始化失败：', e.message || e);
+        }
+      });
+
+      renderer.xr.addEventListener('sessionend', () => {
+        hitTestSource = null; viewerSpace = null; xrRefSpace = null;
+        xrSession = null; placed = false; root.visible = false; log('XR 会话结束。');
+      });
+
+      // 轻点放置
       renderer.domElement.addEventListener('click', () => {
         if (reticle.visible && !placed) {
           root.visible = true;
-          root.position.setFromMatrixPosition(reticle.matrix);
-          // 让路径朝向与相机朝向一致一点点（可选轻微对齐）
-          const rot = new THREE.Matrix4().extractRotation(reticle.matrix);
-          const quat = new THREE.Quaternion().setFromRotationMatrix(rot);
+          const m = new THREE.Matrix4().fromArray(reticle.matrix.elements);
+          const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scl = new THREE.Vector3();
+          m.decompose(pos, quat, scl);
+          root.position.copy(pos);
           root.quaternion.copy(quat);
           placed = true;
           log('已放置路径。');
         }
       });
 
-      // 启动会话
+      // 帧循环
       renderer.setAnimationLoop(render);
-
-      async function onSessionStart() {
-        const session = renderer.xr.getSession();
-        const viewerSpace = await session.requestReferenceSpace('viewer');
-        const refSpace = await session.requestReferenceSpace('local');
-        const hitTestSourceReq = await session.requestHitTestSource({ space: viewerSpace });
-
-        hitTestSource = hitTestSourceReq;
-        hitTestSourceRequested = true;
-
-        // 帧循环里用 refSpace 做 getPose
-        renderer.xr.setReferenceSpace(refSpace);
-      }
-
-      onSessionStart().catch(e => log('XR 会话初始化失败：', e.message));
     }
 
-    // ========== 帧循环 ==========
-    function render(timestamp, frame) {
-      if (frame) {
-        const session = renderer.xr.getSession();
-        if (!hitTestSourceRequested) { /* 等待 onSessionStart */ }
-        if (hitTestSource) {
-          const refSpace = renderer.xr.getReferenceSpace();
-          const hitTestResults = frame.getHitTestResults(hitTestSource);
-          if (!placed && hitTestResults.length > 0) {
-            const pose = hitTestResults[0].getPose(refSpace);
-            if (pose) {
-              reticle.visible = true;
-              reticle.matrix.fromArray(pose.transform.matrix);
-            }
-          } else {
-            reticle.visible = false;
+    // ---- 帧循环 ----
+    function render(t, frame) {
+      if (frame && hitTestSource && !placed) {
+        const results = frame.getHitTestResults(hitTestSource);
+        if (results.length && xrRefSpace) {
+          const pose = results[0].getPose(xrRefSpace);
+          if (pose) {
+            reticle.visible = true;
+            reticle.matrix.fromArray(pose.transform.matrix);
           }
+        } else {
+          reticle.visible = false;
         }
       }
       renderer.render(scene, camera);
     }
 
-    // ========== 自适应 ==========
+    // ---- 自适应 ----
     window.addEventListener('resize', () => {
       if (!renderer || !camera) return;
       renderer.setSize(window.innerWidth, window.innerHeight);
