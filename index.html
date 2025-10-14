@@ -2,251 +2,142 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <title>AR 导航演示 (WebXR + Three.js)</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>WebXR + Three.js 一页式 WebAR 示例</title>
   <style>
-    html,body{margin:0;height:100%;background:#000;color:#fff;font-family:system-ui,-apple-system}
-    #ui{position:fixed;left:0;right:0;top:0;padding:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:center;background:rgba(0,0,0,.35);backdrop-filter:blur(6px);z-index:10}
-    #log{position:fixed;left:8px;bottom:8px;font-size:12px;opacity:.85;white-space:pre-wrap}
-    input[type=file],button,textarea{font-size:14px}
-    textarea{width:100%;max-width:680px;height:120px;background:#111;color:#eee;border:1px solid #333;border-radius:8px;padding:8px}
-    #overlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.5);z-index:9}
-    canvas{touch-action:none}
+    html,body { margin:0; height:100%; overflow:hidden; background:#000; }
+    #info {
+      position: fixed; left: 0; right: 0; bottom: 0;
+      padding: 10px 12px; color:#fff; font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
+      background: linear-gradient(180deg, rgba(0,0,0,.0), rgba(0,0,0,.55));
+      pointer-events: none;
+      text-align: center;
+    }
+    .ar-supported #hint { opacity:.9 }
+    #hint { opacity:.75 }
+    .hidden { display:none }
+    canvas { touch-action: none; }
   </style>
 </head>
 <body>
-  <div id="ui">
-    <input id="file" type="file" accept=".json,application/json" />
-    <button id="btnPaste">粘贴 JSON</button>
-    <button id="btnUseSample">用内置样例</button>
-    <span id="arBtnSlot"></span>
+  <div id="info">
+    <div id="hint">对着地面慢慢移动手机让圆环锁定平面；点击屏幕放置一个小方块。</div>
+    <div id="unsupported" class="hidden">此设备/浏览器不支持 WebXR AR。请使用 Android 的 Chrome 并通过 HTTPS/localhost 打开。</div>
   </div>
-  <div id="overlay"><textarea id="jsonText" placeholder="在这里粘贴 JSON，关闭后点 Start AR"></textarea></div>
-  <div id="log"></div>
 
   <script type="module">
-    import * as THREE from 'https://unpkg.com/three@0.161.0/build/three.module.js';
-    import { ARButton } from 'https://unpkg.com/three@0.161.0/examples/jsm/webxr/ARButton.js';
+    // 采用 ESM CDN（也可改成本地依赖）
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { ARButton } from 'https://unpkg.com/three@0.160.0/examples/jsm/webxr/ARButton.js';
 
-    // ---------- UI refs ----------
-    const $file = document.getElementById('file');
-    const $btnPaste = document.getElementById('btnPaste');
-    const $btnUseSample = document.getElementById('btnUseSample');
-    const $overlay = document.getElementById('overlay');
-    const $jsonText = document.getElementById('jsonText');
-    const $arBtnSlot = document.getElementById('arBtnSlot');
-    const $log = document.getElementById('log');
+    // 基础场景
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 30);
 
-    // ---------- state ----------
-    let jsonData = null;
-    let renderer, scene, camera;
-    let reticle, root = new THREE.Group();
-    let hitTestSource = null;
-    let xrRefSpace = null;
-    let placed = false;
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true;
+    document.body.appendChild(renderer.domElement);
 
-    const log = (...a)=>{ console.log(...a); $log.textContent = a.join(' '); };
+    // 柔和一点的光
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.0));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+    dir.position.set(1, 2, 1);
+    scene.add(dir);
 
-    // ---------- trace 解析 / 构建 ----------
-    function parseTrace(o){
-      if(!o || !Array.isArray(o.steps)) throw new Error('无效 JSON：缺少 steps[]');
-      return o;
-    }
+    // 命中指示器（reticle）：一个贴地小圆环
+    const reticleGeo = new THREE.RingGeometry(0.07, 0.09, 32).rotateX(-Math.PI / 2);
+    const reticleMat = new THREE.MeshBasicMaterial({ color: 0x00ff88, transparent: true, opacity: 0.9 });
+    const reticle = new THREE.Mesh(reticleGeo, reticleMat);
+    reticle.matrixAutoUpdate = false;  // 用设备返回的姿态矩阵直接更新
+    reticle.visible = false;
+    scene.add(reticle);
 
-    function buildPathFromSteps(trace){
-      const g = new THREE.Group();
-      const arrows = new THREE.Group();
-      const pts = [new THREE.Vector3(0,0,0)];
-      let theta = 0, x = 0, z = 0;
-
-      for(const s of trace.steps){
-        const turn = (s.deltaYawDeg||0)*Math.PI/180;
-        theta += turn;
-        const stride = s.strideEstM ?? 0.7;
-        const dx = Math.sin(theta)*stride, dz = Math.cos(theta)*stride;
-        x += dx; z += dz;
-        pts.push(new THREE.Vector3(x,0,z));
-
-        const seg = new THREE.Group();
-        const cyl = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.035,0.035,stride*0.85,16),
-          new THREE.MeshStandardMaterial({ metalness:.1, roughness:.6 })
-        );
-        cyl.rotation.x = Math.PI/2; cyl.position.z = (stride*0.85)/2;
-        const cone = new THREE.Mesh(
-          new THREE.ConeGeometry(0.07,0.14,16),
-          new THREE.MeshStandardMaterial({ metalness:.1, roughness:.4 })
-        );
-        cone.position.z = stride*0.85+0.07;
-        seg.add(cyl,cone);
-        seg.position.set(x-dx,0.02,z-dz);
-        seg.rotation.y = theta;
-        arrows.add(seg);
-      }
-
-      const geom = new THREE.BufferGeometry();
-      const arr = new Float32Array(pts.length*3);
-      pts.forEach((p,i)=>{ arr[3*i]=p.x; arr[3*i+1]=0.01; arr[3*i+2]=p.z; });
-      geom.setAttribute('position', new THREE.BufferAttribute(arr,3));
-      const line = new THREE.Line(geom, new THREE.LineBasicMaterial());
-
-      const startMarker = new THREE.Mesh(new THREE.TorusGeometry(0.15,0.03,12,48).rotateX(-Math.PI/2),
-                                         new THREE.MeshStandardMaterial({ color:0x00ff88 }));
-      const endMarker = new THREE.Mesh(new THREE.SphereGeometry(0.08,24,16),
-                                       new THREE.MeshStandardMaterial({ color:0xffcc00 }));
-      startMarker.position.set(0,0.02,0);
-      const last = pts[pts.length-1]; endMarker.position.set(last.x,0.08,last.z);
-
-      if(trace.startPoseHint && (trace.startPoseHint.face||trace.startPoseHint.landmark)){
-        const label = makeTextSprite(`${trace.startPoseHint.face||''} ${trace.startPoseHint.landmark||''}`.trim());
-        label.position.set(0,0.25,0);
-        g.add(label);
-      }
-
-      g.add(line, arrows, startMarker, endMarker);
-      return g;
-    }
-
-    function makeTextSprite(text){
-      const canvas = document.createElement('canvas'); canvas.width=1024; canvas.height=256;
-      const ctx = canvas.getContext('2d');
-      ctx.font = '700 40px ui-sans-serif,Helvetica,Arial';
-      ctx.textBaseline='middle'; ctx.textAlign='center';
-      ctx.strokeStyle='#000'; ctx.lineWidth=10; ctx.strokeText(text,512,128);
-      ctx.fillStyle='#fff'; ctx.fillText(text,512,128);
-      const tex = new THREE.CanvasTexture(canvas);
-      const mat = new THREE.SpriteMaterial({ map: tex, transparent:true });
-      const sp = new THREE.Sprite(mat); sp.scale.set(0.8,0.2,1);
-      return sp;
-    }
-
-    // ---------- 文件/按钮 ----------
-    $file.addEventListener('change', async e=>{
-      const f = e.target.files?.[0]; if(!f) return;
-      try{ jsonData = parseTrace(JSON.parse(await f.text())); log('已载入：', f.name); }
-      catch(err){ log('解析失败：', err.message); }
-    });
-
-    $btnPaste.addEventListener('click', ()=>{ $overlay.style.display='flex'; });
-    $btnUseSample.addEventListener('click', ()=>{
-      jsonData = {
-        "traceId":"demo",
-        "meta":{"createdAt":"2025-10-12T16:18:44Z","device":"iPhone/26.0","samplingHz":{"devMotion":100}},
-        "startPoseHint":{"face":"面向大厅出口开始","landmark":"1楼前台"},
-        "steps":[
-          {"i":0,"deltaYawDeg":-5.8186108811,"strideEstM":0.72,"events":[]},
-          {"i":1,"deltaYawDeg":-3.0823780035,"strideEstM":0.72,"events":[]},
-          {"i":2,"deltaYawDeg":-4.2384868957,"strideEstM":0.72,"events":[]},
-          {"i":3,"deltaYawDeg": 2.3518082060,"strideEstM":0.72,"events":[]},
-          {"i":4,"deltaYawDeg":-1.7490299876,"strideEstM":0.72,"events":[]},
-          {"i":5,"deltaYawDeg": 1.2722277934,"strideEstM":0.72,"events":[]}
-        ],
-        "keyEvents":[],
-        "annotations":[]
-      };
-      log('已载入内置样例。');
-    });
-
-    // ---------- 初始化 Three 与 ARButton ----------
-    initThree();
-    setupARButton();
-
-    function initThree(){
-      renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      renderer.xr.enabled = true;
-      document.body.appendChild(renderer.domElement);
-
-      scene = new THREE.Scene();
-      camera = new THREE.PerspectiveCamera();
-
-      scene.add(new THREE.HemisphereLight(0xffffff,0x444444,1.0));
-      const dir = new THREE.DirectionalLight(0xffffff,0.6); dir.position.set(1,2,1); scene.add(dir);
-
-      reticle = new THREE.Mesh(
-        new THREE.RingGeometry(0.15,0.18,32).rotateX(-Math.PI/2),
-        new THREE.MeshBasicMaterial({ color:0x00ffaa })
+    // 点击放置：从 XR 控制器（触摸）拿事件
+    const controller = renderer.xr.getController(0);
+    controller.addEventListener('select', () => {
+      if (!reticle.visible) return;
+      // 放一个 10cm 的小方块
+      const box = new THREE.Mesh(
+        new THREE.BoxGeometry(0.1, 0.1, 0.1),
+        new THREE.MeshStandardMaterial({ color: 0x42a5f5, metalness: 0.1, roughness: 0.8 })
       );
-      reticle.matrixAutoUpdate = false; reticle.visible = false; scene.add(reticle);
+      // 把 reticle 的世界矩阵应用到 box
+      box.position.setFromMatrixPosition(reticle.matrix);
+      const quat = new THREE.Quaternion().setFromRotationMatrix(reticle.matrix);
+      box.quaternion.copy(quat);
+      scene.add(box);
+    });
+    scene.add(controller);
 
-      // 帧循环
-      renderer.setAnimationLoop(render);
-      window.addEventListener('resize', ()=>{
-        renderer.setSize(window.innerWidth, window.innerHeight);
-        if(camera.isPerspectiveCamera){ camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); }
-      });
+    // WebXR Hit Test 所需变量
+    let hitTestSource = null;
+    let viewerSpace = null;
+    let localSpace = null;
 
-      // 点击放置
-      renderer.domElement.addEventListener('click', ()=>{
-        if(reticle.visible && !placed){
-          root.visible = true;
-          const m = new THREE.Matrix4().fromArray(reticle.matrix.elements);
-          const pos = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
-          m.decompose(pos,q,s);
-          root.position.copy(pos); root.quaternion.copy(q);
-          placed = true; log('已放置路径。');
-        }
+    // 创建进入 AR 的按钮，并声明需要 hit-test
+    // 注意：必须在 HTTPS 或 localhost 下，且设备/浏览器支持 WebXR-AR
+    const arButton = ARButton.createButton(renderer, {
+      requiredFeatures: ['hit-test'],               // 命中测试
+      optionalFeatures: ['dom-overlay'],            // 可选：把按钮/提示覆盖在画面上
+      domOverlay: { root: document.body }
+    });
+    document.body.appendChild(arButton);
+
+    // 支持性检查（用于显示提示）
+    if (navigator.xr && navigator.xr.isSessionSupported) {
+      navigator.xr.isSessionSupported('immersive-ar').then(supported => {
+        document.body.classList.toggle('ar-supported', supported);
+        if (!supported) document.getElementById('unsupported').classList.remove('hidden');
+      }).catch(() => {
+        document.getElementById('unsupported').classList.remove('hidden');
       });
+    } else {
+      document.getElementById('unsupported').classList.remove('hidden');
     }
 
-    function setupARButton(){
-      const arBtn = ARButton.createButton(renderer, {
-        requiredFeatures: ['hit-test'],
-        optionalFeatures: ['local-floor','dom-overlay'],
-        domOverlay: { root: document.body }
+    // 当开始 AR 会话时，向 XR 系统申请 hit test 源
+    renderer.xr.addEventListener('sessionstart', async () => {
+      const session = renderer.xr.getSession();
+      viewerSpace = await session.requestReferenceSpace('viewer');
+      localSpace = await session.requestReferenceSpace('local');
+      hitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+
+      // 可选：当会话结束时清理
+      session.addEventListener('end', () => {
+        hitTestSource = null;
+        viewerSpace = null;
+        localSpace = null;
+        reticle.visible = false;
       });
-      // 把默认按钮放到你 UI 区域
-      $arBtnSlot.innerHTML = ''; $arBtnSlot.appendChild(arBtn);
+    });
 
-      // 监听会话开始/结束
-      renderer.xr.addEventListener('sessionstart', async ()=>{
-        placed = false; root.visible = false; log('XR 会话已开始，选择/粘贴 JSON 后点地面放置。');
-
-        // 从粘贴框取数据（若还没读文件）
-        if(!jsonData && $overlay.style.display==='flex' && $jsonText.value.trim()){
-          try{ jsonData = parseTrace(JSON.parse($jsonText.value)); $overlay.style.display='none'; }
-          catch(e){ log('粘贴 JSON 解析失败：', e.message); }
-        }
-        if(!jsonData){ log('请先选择/粘贴 JSON。'); }
-
-        // 准备 reference space 与 hit-test
-        const session = renderer.xr.getSession();
-        try{
-          xrRefSpace = await session.requestReferenceSpace('local-floor').catch(()=>session.requestReferenceSpace('local'));
-          const viewer = await session.requestReferenceSpace('viewer');
-          hitTestSource = await session.requestHitTestSource({ space: viewer });
-        }catch(e){ log('XR 初始化失败：', e.message||e); }
-
-        // 构建路径
-        if(jsonData){
-          root.clear();
-          const path = buildPathFromSteps(jsonData);
-          path.position.y = 0.02;
-          root.add(path);
-          scene.add(root);
-        }
-      });
-
-      renderer.xr.addEventListener('sessionend', ()=>{
-        hitTestSource = null; xrRefSpace = null; placed = false; root.visible = false;
-        log('XR 会话结束。');
-      });
-    }
-
-    // ---------- 帧循环 ----------
-    function render(t, frame){
-      if(frame && hitTestSource && !placed && xrRefSpace){
-        const hits = frame.getHitTestResults(hitTestSource);
-        if(hits.length){
-          const pose = hits[0].getPose(xrRefSpace);
-          if(pose){ reticle.visible = true; reticle.matrix.fromArray(pose.transform.matrix); }
-        }else{
+    // 每帧执行：做 hit test，更新 reticle
+    renderer.setAnimationLoop((timestamp, frame) => {
+      if (frame && hitTestSource && localSpace) {
+        const hitTestResults = frame.getHitTestResults(hitTestSource);
+        if (hitTestResults.length > 0) {
+          const referenceSpace = localSpace;
+          const hit = hitTestResults[0];
+          const pose = hit.getPose(referenceSpace);
+          if (pose) {
+            reticle.visible = true;
+            reticle.matrix.fromArray(pose.transform.matrix);
+          }
+        } else {
           reticle.visible = false;
         }
       }
       renderer.render(scene, camera);
-    }
+    });
+
+    // 自适应窗口
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
   </script>
 </body>
 </html>
