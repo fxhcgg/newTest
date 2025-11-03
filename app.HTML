@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>楼层静态展示（params.json + 可选 floor.png）</title>
+<style>
+  html,body{height:100%} body{margin:0;background:#0b0f10;color:#cfe;font:14px/1.5 system-ui}
+  #wrap{display:grid;grid-template-columns:1fr 320px;gap:10px;height:100%}
+  #left{position:relative;background:#000;overflow:hidden}
+  #cv{position:absolute;inset:0;touch-action:none}
+  #right{padding:12px;background:#101618;border-left:1px solid #20352c;overflow:auto}
+  h3{margin:8px 0}
+  .pill{display:inline-flex;gap:8px;align-items:center;background:#0e1a16;border:1px solid #20352c;border-radius:999px;padding:6px 10px;margin-right:8px}
+  .ok{color:#74f0b2}.warn{color:#ffde7a}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="left"><canvas id="cv"></canvas></div>
+  <div id="right">
+    <h3>静态预览</h3>
+    <p class="warn">本页只需要 <code>world_to_floor_params.json</code>。同目录如果放了 <code>floor.png</code> 会自动显示。</p>
+    <div class="pill">拖拽平移</div><div class="pill">滚轮缩放</div><div class="pill">点击落点</div>
+    <h3>状态</h3>
+    <div id="stat">正在加载 params…</div>
+  </div>
+</div>
+
+<script>
+(async function(){
+  const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+  const stat = document.getElementById('stat');
+  function resize(){ cv.width=cv.clientWidth||window.innerWidth; cv.height=cv.clientHeight||window.innerHeight; draw(); }
+  new ResizeObserver(resize).observe(cv); resize();
+
+  // 读取 world_to_floor_params.json
+  let P=null;
+  try{
+    const resp = await fetch('world_to_floor_params.json', {cache:'no-store'});
+    P = await resp.json();
+    stat.textContent = '已加载 params.json';
+  }catch(e){
+    stat.textContent = '找不到 world_to_floor_params.json（请确认与 app.html 同目录）';
+    return;
+  }
+
+  // 尝试加载 floor.png（可选）
+  let img=null, imgW=0, imgH=0;
+  try{
+    img = new Image();
+    img.onload = ()=>{ imgW=img.naturalWidth; imgH=img.naturalHeight; fitView(true); draw(); stat.textContent+=' · 已加载 floor.png'; };
+    img.onerror = ()=>{ img=null; stat.textContent+=' · 未找到 floor.png，使用网格背景'; fitView(); draw(); };
+    img.src = 'floor.png?ts='+Date.now();
+  }catch{ /* 忽略 */ }
+
+  // 视图
+  let scale=1, offsetX=0, offsetY=0;
+  const uv2scr = (u,v)=>[u*scale+offsetX, v*scale+offsetY];
+  const scr2uv = (x,y)=>[(x-offsetX)/scale,(y-offsetY)/scale];
+
+  // 根据参数里的尺寸/范围自适配
+  function fitView(bump=false){
+    let minx=0,miny=0,maxx=1000,maxy=600;
+    if (img && imgW && imgH){ minx=0;miny=0;maxx=imgW;maxy=imgH; }
+    else if (P?.proj_params?.W && P?.proj_params?.H){ minx=0;miny=0;maxx=P.proj_params.W;maxy=P.proj_params.H; }
+    const W=cv.width,H=cv.height,bw=maxx-minx,bh=maxy-miny;
+    scale = Math.min(W/bw, H/bh) * (bump?1.05:0.95);
+    offsetX = (W-bw*scale)/2 - minx*scale;
+    offsetY = (H-bh*scale)/2 - miny*scale;
+  }
+
+  // 世界(X,Z米) → 楼层像素(u,v)（按你的 JSON：XZ 平面，可能含U轴镜像）
+  function worldToUV(x,z){
+    const pp=P.proj_params, flip=P.axis_flip_uv||[1,1];
+    let u = (x - pp.minuv[0]) * pp.scale; // X → u
+    let v = (z - pp.minuv[1]) * pp.scale; // Z → v
+    u *= flip[0]; v *= flip[1];
+    return {u,v};
+  }
+
+  // 交互：平移/缩放/点击落点
+  let dragging=false,lastX=0,lastY=0, pinch=false,lastD=0,cx=0,cy=0;
+  cv.addEventListener('mousedown',e=>{dragging=true;lastX=e.clientX;lastY=e.clientY;});
+  window.addEventListener('mouseup',()=>dragging=false);
+  cv.addEventListener('mousemove',e=>{ if(dragging){ offsetX+=e.clientX-lastX; offsetY+=e.clientY-lastY; lastX=e.clientX; lastY=e.clientY; draw(); }});
+  cv.addEventListener('wheel',e=>{ const k=Math.exp(-e.deltaY*0.0015); zoomAt(e.offsetX,e.offsetY,k); e.preventDefault(); },{passive:false});
+  function zoomAt(cx,cy,k){ const [u0,v0]=scr2uv(cx,cy); scale*=k; const sx=u0*scale+offsetX, sy=v0*scale+offsetY; offsetX+=(cx-sx); offsetY+=(cy-sy); draw(); }
+  cv.addEventListener('touchstart',e=>{
+    if(e.touches.length===1){dragging=true;lastX=e.touches[0].clientX;lastY=e.touches[0].clientY;}
+    if(e.touches.length===2){pinch=true;const dx=e.touches[0].clientX-e.touches[1].clientX,dy=e.touches[0].clientY-e.touches[1].clientY;lastD=Math.hypot(dx,dy);cx=(e.touches[0].clientX+e.touches[1].clientX)/2;cy=(e.touches[0].clientY+e.touches[1].clientY)/2;}
+  },{passive:false});
+  cv.addEventListener('touchmove',e=>{
+    e.preventDefault();
+    if(pinch && e.touches.length===2){ const dx=e.touches[0].clientX-e.touches[1].clientX,dy=e.touches[0].clientY-e.touches[1].clientY; const d=Math.hypot(dx,dy); zoomAt(cx,cy,d/lastD); lastD=d; }
+    else if(dragging && e.touches.length===1){ offsetX+=e.touches[0].clientX-lastX; offsetY+=e.touches[0].clientY-lastY; lastX=e.touches[0].clientX; lastY=e.touches[0].clientY; draw(); }
+  },{passive:false});
+  window.addEventListener('touchend',()=>{dragging=false;pinch=false;});
+
+  // 点击：在该处放“当前位置”点（米制→uv→画）
+  let cur=null; // {x,z}
+  cv.addEventListener('click',e=>{
+    const [u,v]=scr2uv(e.offsetX,e.offsetY);
+    // 反算近似米制（用于展示；严格反算：按 minuv/scale 与 axis_flip）
+    const flip=P.axis_flip_uv||[1,1], pp=P.proj_params;
+    const x = ( (u/flip[0]) / pp.scale ) + pp.minuv[0];
+    const z = ( (v/flip[1]) / pp.scale ) + pp.minuv[1];
+    cur = {x,z};
+    draw();
+  });
+
+  // 画
+  function draw(){
+    const W=cv.width,H=cv.height; ctx.clearRect(0,0,W,H);
+    ctx.save(); ctx.setTransform(scale,0,0,scale,offsetX,offsetY);
+    if(img){ ctx.drawImage(img,0,0); }
+    else{ // 网格背景（按 1m ≈ 若干像素估计）
+      const pitch = (1.0 / (P.meters_per_floor_px || 0.02045)); // 约 49px/m
+      ctx.lineWidth=1/scale; ctx.strokeStyle='#182622';
+      for(let x=-2000;x<=4000;x+=pitch){ ctx.beginPath(); ctx.moveTo(x,-2000); ctx.lineTo(x,4000); ctx.stroke(); }
+      for(let y=-2000;y<=4000;y+=pitch){ ctx.beginPath(); ctx.moveTo(-2000,y); ctx.lineTo(4000,y); ctx.stroke(); }
+    }
+    // 如果有当前点，画出来
+    if(cur){
+      const uv = worldToUV(cur.x, cur.z);
+      ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(uv.u, uv.v, 5/scale, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle='#8ff'; ctx.font=`${12/scale}px system-ui`;
+      ctx.fillText(`(x=${cur.x.toFixed(2)}m, z=${cur.z.toFixed(2)}m)`, uv.u+8/scale, uv.v-8/scale);
+    }
+    ctx.restore();
+
+    // HUD
+    const zoomInfo = `缩放 ${scale.toFixed(2)}`;
+    const imgInfo = img?` · 底图 ${imgW}×${imgH}`:' · 无底图(网格)';
+    const curInfo = cur?` · 点(x=${cur.x.toFixed(2)}, z=${cur.z.toFixed(2)})m`:'';
+    stat.textContent = '就绪 · '+zoomInfo+imgInfo+curInfo;
+  }
+
+  // 初始视图
+  fitView();
+  draw();
+})();
+</script>
+</body>
+</html>
