@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>室内 AR 导航 Demo</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="top-bar">
+    <h1>室内 AR 导航</h1>
+  </header>
+
+  <main>
+    <section class="controls">
+      <div class="form-row">
+        <label for="dest-room">目标房间：</label>
+        <select id="dest-room"></select>
+      </div>
+      <div class="form-row">
+        <button id="set-start-help" type="button">
+          ① 在平面图上点一下设定当前位置
+        </button>
+      </div>
+      <div class="form-row">
+        <button id="start-ar" type="button">
+          ② 开始 AR 导航
+        </button>
+      </div>
+    </section>
+
+    <section class="tabs">
+      <button class="tab-button active" data-tab="map-tab">平面图</button>
+      <button class="tab-button" data-tab="ar-tab">AR 视图</button>
+    </section>
+
+    <!-- 平面图视图 -->
+    <section id="map-tab" class="tab-content active">
+      <div class="map-wrapper">
+        <canvas id="floor-canvas"></canvas>
+        <div class="map-hint">
+          点击平面图设置当前位置（红点），目标房间会高亮。
+        </div>
+      </div>
+    </section>
+
+    <!-- AR 视图 -->
+    <section id="ar-tab" class="tab-content">
+      <div class="ar-wrapper">
+        <video id="camera" autoplay playsinline muted></video>
+        <div id="ar-overlay">
+          <div id="arrow">▲</div>
+          <div id="ar-status"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>纯静态前端 Demo，可直接部署 GitHub Pages。</p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
