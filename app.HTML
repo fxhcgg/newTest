@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
-<title>两房间手动导航（同目录部署）</title>
+<title>两房间手动导航（同目录部署 · 修复TDZ）</title>
 <style>
   html,body{margin:0;background:#000;overflow:hidden;touch-action:none;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
   #cam{position:fixed;left:0;top:0;width:100vw;height:100vh;object-fit:cover;background:#000;z-index:0;}
@@ -45,7 +45,6 @@
 <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
 <script>
 (async function(){
-  // —— 文件与页面并排 —— //
   const FILES = {
     rooms: 'rooms_world.geojson',
     plyPrimary: 'oriented.ply',
@@ -76,6 +75,16 @@
   const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.01, 5000);
   scene.add(new THREE.AmbientLight(0xffffff,1.0));
   const world = new THREE.Group(); scene.add(world);
+
+  // —— 把依赖的对象“提前初始化”，避免 TDZ —— //
+  const roomsGroup = new THREE.Group(); world.add(roomsGroup);
+  const pathLine = new THREE.Line(
+    new THREE.BufferGeometry(),
+    new THREE.LineDashedMaterial({color:0xffffff, dashSize:0.3, gapSize:0.15})
+  );
+  pathLine.computeLineDistances();
+  world.add(pathLine);
+  const arrow = makeArrow(); world.add(arrow); arrow.visible=false;
 
   // UI
   const hud = document.getElementById('hud');
@@ -111,7 +120,7 @@
       const poly=(f.geometry&&f.geometry.type==='Polygon')? f.geometry.coordinates[0] : [];
       return { id: prop.room_id ?? (i+1), name: prop.name ?? '', poly, centroid: centroid(poly) };
     });
-    drawRooms(rooms);
+    drawRooms(rooms);  // <-- 现在 roomsGroup 已在上面初始化，安全
     rooms.forEach(r=>{
       const o1=document.createElement('option'); o1.value=String(r.id); o1.textContent=`${r.id}${r.name?(' - '+r.name):''}`; selS.appendChild(o1);
       const o2=document.createElement('option'); o2.value=String(r.id); o2.textContent=`${r.id}${r.name?(' - '+r.name):''}`; selE.appendChild(o2.cloneNode(true));
@@ -120,7 +129,7 @@
     setLine('rooms_world.geojson', `OK (${(performance.now()-t0|0)}ms, rooms=${rooms.length})`, 'ok');
   }catch(e){
     setLine('rooms_world.geojson', `FAILED：${e.message||e}`, 'err');
-    return; // 没房间就不继续
+    return;
   }
 
   // 4) 加载点云（同目录，可选）
@@ -181,11 +190,38 @@
   hDown.onclick    = ()=> userHeight=Math.max(0.8, userHeight-0.2);
   hUp.onclick      = ()=> userHeight=Math.min(3.0, userHeight+0.2);
 
-  // 房间与路径
-  const roomsGroup = new THREE.Group(); world.add(roomsGroup);
-  const pathLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineDashedMaterial({color:0xffffff, dashSize:0.3, gapSize:0.15}));
-  pathLine.computeLineDistances(); world.add(pathLine);
-  const arrow = makeArrow(); world.add(arrow); arrow.visible=false;
+  // 渲染循环
+  function animate(){
+    requestAnimationFrame(animate);
+    updateArrow();
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  // 自适应
+  window.addEventListener('resize', ()=>{
+    camera.aspect = window.innerWidth/window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight, false);
+  });
+
+  // ====== 绘制/工具函数 ======
+  function drawRooms(rs){
+    roomsGroup.clear();
+    const lineMat = new THREE.LineBasicMaterial({color:0x00A2FF});
+    const fillMat = new THREE.MeshBasicMaterial({color:0x0066ff, transparent:true, opacity:.12, depthWrite:false});
+    rs.forEach(r=>{
+      const up=0.02;
+      const pts3 = r.poly.map(([x,y])=> new THREE.Vector3(x, up, y));
+      const geoLine = new THREE.BufferGeometry().setFromPoints(pts3.concat([pts3[0]]));
+      roomsGroup.add(new THREE.Line(geoLine, lineMat));
+      const shapexz = new THREE.Shape(); r.poly.forEach(([x,y],k)=> k? shapexz.lineTo(x,y): shapexz.moveTo(x,y));
+      shapexz.autoClose = true;
+      const geo = new THREE.ShapeGeometry(shapexz);
+      const mesh = new THREE.Mesh(geo, fillMat); mesh.rotation.x=-Math.PI/2; mesh.position.y=up;
+      roomsGroup.add(mesh);
+    });
+  }
 
   function updatePathAndHUD(){
     const geo = new THREE.BufferGeometry();
@@ -205,7 +241,6 @@
 
   function updateArrow(){
     if (!endPos || !arrow.visible) return;
-    // 纯演示：箭头放在“相机前方 1m”，朝向终点；通过±5°微调 yaw 控制“前方”的方向感
     const yaw = THREE.MathUtils.degToRad(userYawDeg);
     const camPos = camera.position.clone();
     const forward = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
@@ -215,39 +250,19 @@
     arrow.lookAt(target);
   }
 
-  function drawRooms(rs){
-    roomsGroup.clear();
-    const lineMat = new THREE.LineBasicMaterial({color:0x00A2FF});
-    const fillMat = new THREE.MeshBasicMaterial({color:0x0066ff, transparent:true, opacity:.12, depthWrite:false});
-    rs.forEach(r=>{
-      const up=0.02;
-      const pts3 = r.poly.map(([x,y])=> new THREE.Vector3(x, up, y));
-      const geoLine = new THREE.BufferGeometry().setFromPoints(pts3.concat([pts3[0]]));
-      roomsGroup.add(new THREE.Line(geoLine, lineMat));
-      const shapexz = new THREE.Shape(); r.poly.forEach(([x,y],k)=> k? shapexz.lineTo(x,y): shapexz.moveTo(x,y));
-      shapexz.autoClose = true;
-      const geo = new THREE.ShapeGeometry(shapexz);
-      const mesh = new THREE.Mesh(geo, fillMat); mesh.rotation.x=-Math.PI/2; mesh.position.y=up;
-      roomsGroup.add(mesh);
-    });
+  function makeArrow(){
+    const g = new THREE.PlaneGeometry(0.6,0.6);
+    const c = document.createElement('canvas'); c.width=256; c.height=256;
+    const ctx = c.getContext('2d');
+    ctx.strokeStyle='#fff'; ctx.lineWidth=16; ctx.lineCap='round'; ctx.lineJoin='round';
+    ctx.beginPath();
+    ctx.moveTo(128,32); ctx.lineTo(64,128); ctx.lineTo(104,128); ctx.lineTo(104,224);
+    ctx.lineTo(152,224); ctx.lineTo(152,128); ctx.lineTo(192,128); ctx.closePath(); ctx.stroke();
+    const tex = new THREE.CanvasTexture(c);
+    const m = new THREE.MeshBasicMaterial({map:tex, transparent:true, depthWrite:false});
+    return new THREE.Mesh(g,m);
   }
 
-  // 渲染循环
-  function animate(){
-    requestAnimationFrame(animate);
-    updateArrow();
-    renderer.render(scene, camera);
-  }
-  animate();
-
-  // 自适应
-  window.addEventListener('resize', ()=>{
-    camera.aspect = window.innerWidth/window.innerHeight;
-    camera.updateProjectionMatrix();
-    renderer.setSize(window.innerWidth, window.innerHeight, false);
-  });
-
-  // —— 点云加载 & PLY 解析 —— //
   function addPointCloud(points){
     if (pcObj){ world.remove(pcObj); pcObj.geometry.dispose(); }
     const arr = new Float32Array(points.length*3);
@@ -256,12 +271,14 @@
     const m = new THREE.PointsMaterial({color:0x00ff00, size:0.03, sizeAttenuation:true});
     pcObj = new THREE.Points(g,m); world.add(pcObj);
   }
+
   function fitView(points){
     let minX=Infinity,minY=Infinity,minZ=Infinity,maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;
     for(const p of points){ const [x,y,z]=p; if(x<minX)minX=x; if(y<minY)minY=y; if(z<minZ)minZ=z; if(x>maxX)maxX=x; if(y>maxY)maxY=y; if(z>maxZ)maxZ=z; }
     const cx=(minX+maxX)/2, cy=(minY+maxY)/2, cz=(minZ+maxZ)/2; const span=Math.max(maxX-minX,maxY-minY,maxZ-minZ);
     camera.position.set(cx, cy+span*0.2, cz+span*1.2); camera.lookAt(cx,cy,cz);
   }
+
   function parsePLY(buffer){
     const bytes = new Uint8Array(buffer);
     let hEnd=-1, header=""; for(let i=0;i<bytes.length&&i<1e6;i++){ header+=String.fromCharCode(bytes[i]); if(header.includes("end_header\n")){ hEnd=i+1; break; } }
@@ -303,7 +320,6 @@
     }
   }
 
-  // —— 小工具 —— //
   function centroid(poly){
     if(!poly || poly.length<3) return [0,0];
     let x=0,y=0,a=0;
