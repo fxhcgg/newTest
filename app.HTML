@@ -3,20 +3,20 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
-<title>两房间手动导航（同目录部署 · 触控修复）</title>
+<title>两房间手动导航（点房间选择）</title>
 <style>
   html,body{margin:0;background:#000;overflow:hidden;touch-action:none;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
   #cam{position:fixed;left:0;top:0;width:100vw;height:100vh;object-fit:cover;background:#000;z-index:0;}
   #gl{position:fixed;left:0;top:0;width:100vw;height:100vh;z-index:1;pointer-events:none;}
   .panel{position:fixed;left:12px;right:12px;bottom:12px;z-index:3;background:rgba(0,0,0,.45);color:#fff;border-radius:12px;padding:10px 12px;backdrop-filter:blur(6px);}
-  /* 恢复控件交互：非常关键 */
+  /* 让控件可交互 */
   .panel, .panel *{ touch-action:auto; pointer-events:auto; }
   .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
   select,button{font-size:12px;background:#111;color:#fff;border:1px solid #333;border-radius:8px;padding:6px 8px}
   .hud{position:fixed;left:12px;top:12px;z-index:3;background:rgba(0,0,0,.35);color:#fff;padding:8px 10px;border-radius:10px;font-size:12px;line-height:1.4}
   .diag{position:fixed;right:12px;top:12px;z-index:3;background:rgba(0,0,0,.5);color:#fff;padding:8px 10px;border-radius:10px;font-size:12px;line-height:1.5;max-width:46vw;}
   .ok{color:#7CFC00} .warn{color:#FFD700} .err{color:#FF6B6B}
-  .quick{display:flex;gap:6px;flex-wrap:wrap}
+  .mode-on{border-color:#0b5; box-shadow:0 0 0 2px rgba(0,187,85,.35) inset;}
 </style>
 </head>
 <body>
@@ -28,12 +28,16 @@
 
 <div class="panel">
   <div class="row">
+    <button id="modeStart" class="">设起点(点房间)</button>
+    <button id="modeEnd" class="">设终点(点房间)</button>
+    <button id="iHere">我在这（点地面）</button>
+    <button id="swap">交换起终</button>
+  </div>
+  <div class="row">
     <label>起点</label>
     <select id="start"><option value="">未选择</option></select>
     <label>终点</label>
     <select id="end"><option value="">未选择</option></select>
-    <button id="iHere">我在这（点地面）</button>
-    <button id="swap">交换起终</button>
   </div>
   <div class="row">
     <label>朝向微调</label>
@@ -43,7 +47,6 @@
     <button id="hDown">-0.2</button>
     <button id="hUp">+0.2</button>
   </div>
-  <div class="row quick" id="quickRow" style="display:none;"></div>
 </div>
 
 <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
@@ -75,8 +78,9 @@
   scene.add(new THREE.AmbientLight(0xffffff,1.0));
   const world = new THREE.Group(); scene.add(world);
 
-  // 依赖对象先初始化（防 TDZ）
+  // 可视层（线/填充）与拾取层（隐形挤出网格）
   const roomsGroup = new THREE.Group(); world.add(roomsGroup);
+  const pickGroup  = new THREE.Group(); world.add(pickGroup); // 用于射线 picking
   const pathLine = new THREE.Line(
     new THREE.BufferGeometry(),
     new THREE.LineDashedMaterial({color:0xffffff, dashSize:0.3, gapSize:0.15})
@@ -93,20 +97,32 @@
   const yawPlus  = document.getElementById('yawPlus');
   const hDown    = document.getElementById('hDown');
   const hUp      = document.getElementById('hUp');
-  const quickRow = document.getElementById('quickRow');
+  const btnModeStart = document.getElementById('modeStart');
+  const btnModeEnd   = document.getElementById('modeEnd');
 
-  // 射线拾取地面
+  // 交互状态
+  let mode = null; // 'start' | 'end' | null
+  function setMode(m){
+    mode = m;
+    btnModeStart.classList.toggle('mode-on', mode==='start');
+    btnModeEnd.classList.toggle('mode-on', mode==='end');
+  }
+  btnModeStart.onclick = ()=> setMode(mode==='start'? null : 'start');
+  btnModeEnd.onclick   = ()=> setMode(mode==='end'?   null : 'end');
+
+  // 拾取工具
   const raycaster = new THREE.Raycaster();
   const pointer = new THREE.Vector2();
   const groundPlane = new THREE.Plane(new THREE.Vector3(0,1,0), 0);
 
-  // 状态
-  let rooms = [];
+  // 数据状态
+  let rooms = [];          // {id,name,poly,centroid}
+  let roomMeshes = [];     // 拾取用 Mesh 列表（带 userData.roomId）
   let startPos = null, endPos = null;
   let userYawDeg = 0, userHeight = 1.6;
   let pcObj = null;
 
-  // 加载 rooms（同目录）
+  // 加载 rooms
   try{
     const t0=performance.now();
     const r = await fetch(FILES.rooms, {cache:'no-store'});
@@ -118,28 +134,23 @@
       const poly=(f.geometry&&f.geometry.type==='Polygon')? f.geometry.coordinates[0] : [];
       return { id: prop.room_id ?? (i+1), name: prop.name ?? '', poly, centroid: centroid(poly) };
     });
-    drawRooms(rooms);
+    drawRoomsAndPickers(rooms);
     // 填下拉
     rooms.forEach(r=>{
       const opt1=document.createElement('option'); opt1.value=String(r.id); opt1.textContent=`${r.id}${r.name?(' - '+r.name):''}`; selS.appendChild(opt1);
       const opt2=opt1.cloneNode(true); selE.appendChild(opt2);
     });
-    // 两房间 → 默认互为起终 + 显示快捷按钮
+    // 若只有两个房间，默认互为起终，并打开“点房间设终点”模式
     if (rooms.length===2){
-      selS.value=String(rooms[0].id); selE.value=String(rooms[1].id); applyRoomSelection();
-      quickRow.style.display='';
-      quickRow.innerHTML = `
-        <button id="btnS1">起点=${rooms[0].name||rooms[0].id}</button>
-        <button id="btnS2">起点=${rooms[1].name||rooms[1].id}</button>
-        <button id="btnE1">终点=${rooms[0].name||rooms[0].id}</button>
-        <button id="btnE2">终点=${rooms[1].name||rooms[1].id}</button>
-      `;
-      document.getElementById('btnS1').onclick = ()=>{ selS.value=String(rooms[0].id); applyRoomSelection(); };
-      document.getElementById('btnS2').onclick = ()=>{ selS.value=String(rooms[1].id); applyRoomSelection(); };
-      document.getElementById('btnE1').onclick = ()=>{ selE.value=String(rooms[0].id); applyRoomSelection(); };
-      document.getElementById('btnE2').onclick = ()=>{ selE.value=String(rooms[1].id); applyRoomSelection(); };
+      selS.value=String(rooms[0].id);
+      selE.value=String(rooms[1].id);
+      applyRoomSelection();
+      setMode('end');
     }
-    setLine('rooms_world.geojson', `OK (${(performance.now()-t0|0)}ms, rooms=${rooms.length})`, 'ok');
+    setLine('rooms_world.geojson', `OK (rooms=${rooms.length})`, rooms.length? 'ok':'warn');
+    if (!rooms.length){
+      logLine('<span class="err">没有房间要素：请检查 GeoJSON 是否为 FeatureCollection 且 geometry 为 Polygon</span>');
+    }
   }catch(e){
     setLine('rooms_world.geojson', `FAILED：${e.message||e}`, 'err');
     return;
@@ -147,60 +158,86 @@
 
   // 加载点云（可选）
   try{
-    const t0=performance.now();
     let resp = await fetch(FILES.plyPrimary, {cache:'no-store'});
     if (!resp.ok) resp = await fetch(FILES.plyFallback, {cache:'no-store'});
-    if (!resp.ok) throw new Error(`not found: oriented.ply / sparse.ply`);
-    const buf = await resp.arrayBuffer();
-    const t1=performance.now();
-    const pts = parsePLY(buf);
-    const t2=performance.now();
-    if (pts.length){ addPointCloud(pts); fitView(pts); setLine('PLY', `OK (download ${(t1-t0|0)}ms, parse ${(t2-t1|0)}ms, points ${pts.length})`, 'ok'); }
-    else setLine('PLY','EMPTY / PARSE ZERO','warn');
+    if (resp.ok){
+      const buf = await resp.arrayBuffer();
+      const pts = parsePLY(buf);
+      if (pts.length){ addPointCloud(pts); fitView(pts); setLine('PLY', `OK (points=${pts.length})`, 'ok'); }
+      else setLine('PLY', 'EMPTY/PARSE ZERO', 'warn');
+    } else {
+      setLine('PLY', 'not found（可忽略）', 'warn');
+    }
   }catch(e){
     setLine('PLY', `FAILED：${e.message||e}`, 'warn');
   }
 
-  // 交互
-  selS.onchange = applyRoomSelection;
-  selE.onchange = applyRoomSelection;
-
-  function applyRoomSelection(){
+  // 下拉变化 → 用房间质心
+  selS.onchange = ()=> {
     const s = rooms.find(r=> String(r.id)===selS.value);
-    const e = rooms.find(r=> String(r.id)===selE.value);
     startPos = s ? new THREE.Vector3(s.centroid[0], 0, s.centroid[1]) : null;
-    endPos   = e ? new THREE.Vector3(e.centroid[0], 0, e.centroid[1]) : null;
     updatePathAndHUD();
-  }
+  };
+  selE.onchange = ()=> {
+    const e = rooms.find(r=> String(r.id)===selE.value);
+    endPos = e ? new THREE.Vector3(e.centroid[0], 0, e.centroid[1]) : null;
+    updatePathAndHUD();
+  };
 
+  // “我在这” → 点地面
   let waitingHere=false;
-  btnHere.onclick = ()=>{ waitingHere=true; setLine('SetHere','点击地面 (y=0) 设起点','warn'); };
-  // 注意：画布 pointer-events:none，所以直接挂在 window 上
+  btnHere.onclick = ()=>{ waitingHere=true; setMode(null); setLine('SetHere','点击地面 (y=0) 设起点','warn'); };
   window.addEventListener('pointerdown', (e)=>{
-    if (!waitingHere) return;
-    waitingHere=false;
     const rect = cnv.getBoundingClientRect();
-    // 转换到 canvas 坐标
     const x = (e.clientX-rect.left)/rect.width;
     const y = (e.clientY-rect.top)/rect.height;
     pointer.x = x*2-1; pointer.y = - (y*2-1);
     raycaster.setFromCamera(pointer, camera);
-    const hit=new THREE.Vector3();
-    if (raycaster.ray.intersectPlane(groundPlane, hit)){
-      startPos = new THREE.Vector3(hit.x, 0, hit.z);
-      selS.value = "";
-      updatePathAndHUD();
-      setLine('SetHere', `OK @ (${hit.x.toFixed(2)}, ${hit.z.toFixed(2)})`, 'ok');
-    } else {
-      setLine('SetHere', '未命中 y=0 平面', 'warn');
+
+    // 1) 优先：房间拾取（如果模式是 start/end）
+    if (mode && roomMeshes.length){
+      const hits = raycaster.intersectObjects(roomMeshes, false);
+      if (hits.length){
+        const rid = hits[0].object.userData.roomId;
+        const r = rooms.find(rr=> String(rr.id)===String(rid));
+        if (r){
+          if (mode==='start'){ selS.value=String(r.id); startPos=new THREE.Vector3(r.centroid[0],0,r.centroid[1]); }
+          else if (mode==='end'){ selE.value=String(r.id); endPos=new THREE.Vector3(r.centroid[0],0,r.centroid[1]); }
+          updatePathAndHUD();
+          setLine('PickRoom', `OK: ${mode} <- ${r.name||r.id}`, 'ok');
+          return;
+        }
+      }
+    }
+
+    // 2) 其次：地面拾取（“我在这”）
+    if (waitingHere){
+      waitingHere=false;
+      const hit=new THREE.Vector3();
+      if (raycaster.ray.intersectPlane(groundPlane, hit)){
+        startPos = new THREE.Vector3(hit.x, 0, hit.z);
+        selS.value = "";
+        updatePathAndHUD();
+        setLine('SetHere', `OK @ (${hit.x.toFixed(2)}, ${hit.z.toFixed(2)})`, 'ok');
+      } else {
+        setLine('SetHere', '未命中 y=0 平面', 'warn');
+      }
     }
   }, {passive:true});
 
-  btnSwap.onclick = ()=>{ const tmp=selS.value; selS.value=selE.value; selE.value=tmp; applyRoomSelection(); };
-  yawMinus.onclick = ()=> userYawDeg -= 5;
-  yawPlus.onclick  = ()=> userYawDeg += 5;
-  hDown.onclick    = ()=> userHeight=Math.max(0.8, userHeight-0.2);
-  hUp.onclick      = ()=> userHeight=Math.min(3.0, userHeight+0.2);
+  // 其他按钮
+  document.getElementById('swap').onclick = ()=>{
+    const tmp=selS.value; selS.value=selE.value; selE.value=tmp;
+    const s = rooms.find(r=> String(r.id)===selS.value);
+    const e = rooms.find(r=> String(r.id)===selE.value);
+    startPos = s ? new THREE.Vector3(s.centroid[0],0,s.centroid[1]) : null;
+    endPos   = e ? new THREE.Vector3(e.centroid[0],0,e.centroid[1]) : null;
+    updatePathAndHUD();
+  };
+  document.getElementById('yawMinus').onclick = ()=> userYawDeg -= 5;
+  document.getElementById('yawPlus').onclick  = ()=> userYawDeg += 5;
+  document.getElementById('hDown').onclick    = ()=> userHeight=Math.max(0.8, userHeight-0.2);
+  document.getElementById('hUp').onclick      = ()=> userHeight=Math.min(3.0, userHeight+0.2);
 
   // 渲染循环
   function animate(){ requestAnimationFrame(animate); updateArrow(); renderer.render(scene, camera); }
@@ -212,21 +249,36 @@
     renderer.setSize(window.innerWidth, window.innerHeight, false);
   });
 
-  // 绘制/工具
-  function drawRooms(rs){
-    roomsGroup.clear();
+  // === 绘制/拾取 ===
+  function drawRoomsAndPickers(rs){
+    roomsGroup.clear(); pickGroup.clear(); roomMeshes = [];
     const lineMat = new THREE.LineBasicMaterial({color:0x00A2FF});
     const fillMat = new THREE.MeshBasicMaterial({color:0x0066ff, transparent:true, opacity:.12, depthWrite:false});
+
     rs.forEach(r=>{
-      const up=0.02;
+      const up = 0.02;
+
+      // 1) 可视：线 + 填充
       const pts3 = r.poly.map(([x,y])=> new THREE.Vector3(x, up, y));
       const geoLine = new THREE.BufferGeometry().setFromPoints(pts3.concat([pts3[0]]));
       roomsGroup.add(new THREE.Line(geoLine, lineMat));
-      const shapexz = new THREE.Shape(); r.poly.forEach(([x,y],k)=> k? shapexz.lineTo(x,y): shapexz.moveTo(x,y));
-      shapexz.autoClose = true;
-      const geo = new THREE.ShapeGeometry(shapexz);
-      const mesh = new THREE.Mesh(geo, fillMat); mesh.rotation.x=-Math.PI/2; mesh.position.y=up;
+
+      const shape = new THREE.Shape();
+      r.poly.forEach(([x,y],k)=> k? shape.lineTo(x,y) : shape.moveTo(x,y));
+      shape.autoClose = true;
+      const geo = new THREE.ShapeGeometry(shape);
+      const mesh = new THREE.Mesh(geo, fillMat);
+      mesh.rotation.x = -Math.PI/2; mesh.position.y = up;
       roomsGroup.add(mesh);
+
+      // 2) 拾取：挤出 2cm 高度的网格，透明但可点
+      const extrude = new THREE.ExtrudeGeometry(shape, {depth:0.02, bevelEnabled:false});
+      const pickMat = new THREE.MeshBasicMaterial({visible:false}); // 隐形拾取
+      const pickMesh = new THREE.Mesh(extrude, pickMat);
+      pickMesh.rotation.x = -Math.PI/2; pickMesh.position.y = up;
+      pickMesh.userData.roomId = r.id;
+      pickGroup.add(pickMesh);
+      roomMeshes.push(pickMesh);
     });
   }
 
@@ -248,7 +300,7 @@
 
   function updateArrow(){
     if (!endPos || !arrow.visible) return;
-    // 演示箭头：放在“相机前方 1m”，朝向终点；前方方向由手动 yaw 决定
+    // 演示箭头：放在“相机前方 1m”，朝向终点；“前方”由手动 yaw 决定
     const yaw = THREE.MathUtils.degToRad(userYawDeg);
     const camPos = camera.position.clone();
     const forward = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
@@ -258,19 +310,7 @@
     arrow.lookAt(target);
   }
 
-  function makeArrow(){
-    const g = new THREE.PlaneGeometry(0.6,0.6);
-    const c = document.createElement('canvas'); c.width=256; c.height=256;
-    const ctx = c.getContext('2d');
-    ctx.strokeStyle='#fff'; ctx.lineWidth=16; ctx.lineCap='round'; ctx.lineJoin='round';
-    ctx.beginPath();
-    ctx.moveTo(128,32); ctx.lineTo(64,128); ctx.lineTo(104,128); ctx.lineTo(104,224);
-    ctx.lineTo(152,224); ctx.lineTo(152,128); ctx.lineTo(192,128); ctx.closePath(); ctx.stroke();
-    const tex = new THREE.CanvasTexture(c);
-    const m = new THREE.MeshBasicMaterial({map:tex, transparent:true, depthWrite:false});
-    return new THREE.Mesh(g,m);
-  }
-
+  // === 点云 & 工具 ===
   function addPointCloud(points){
     if (pcObj){ world.remove(pcObj); pcObj.geometry.dispose(); }
     const arr = new Float32Array(points.length*3);
@@ -279,14 +319,6 @@
     const m = new THREE.PointsMaterial({color:0x00ff00, size:0.03, sizeAttenuation:true});
     pcObj = new THREE.Points(g,m); world.add(pcObj);
   }
-
-  function fitView(points){
-    let minX=Infinity,minY=Infinity,minZ=Infinity,maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;
-    for(const p of points){ const [x,y,z]=p; if(x<minX)minX=x; if(y<minY)minY=y; if(z<minZ)minZ=z; if(x>maxX)maxX=x; if(y>maxY)maxY=y; if(z>maxZ)maxZ=z; }
-    const cx=(minX+maxX)/2, cy=(minY+maxY)/2, cz=(minZ+maxZ)/2; const span=Math.max(maxX-minX,maxY-minY,maxZ-minZ);
-    camera.position.set(cx, cy+span*0.2, cz+span*1.2); camera.lookAt(cx,cy,cz);
-  }
-
   function parsePLY(buffer){
     const bytes = new Uint8Array(buffer);
     let hEnd=-1, header=""; for(let i=0;i<bytes.length&&i<1e6;i++){ header+=String.fromCharCode(bytes[i]); if(header.includes("end_header\n")){ hEnd=i+1; break; } }
@@ -327,7 +359,12 @@
       return pts;
     }
   }
-
+  function fitView(points){
+    let minX=Infinity,minY=Infinity,minZ=Infinity,maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;
+    for(const p of points){ const [x,y,z]=p; if(x<minX)minX=x; if(y<minY)minY=y; if(z<minZ)minZ=z; if(x>maxX)maxX=x; if(y>maxY)maxY=y; if(z>maxZ)maxZ=z; }
+    const cx=(minX+maxX)/2, cy=(minY+maxY)/2, cz=(minZ+maxZ)/2; const span=Math.max(maxX-minX,maxY-minY,maxZ-minZ);
+    camera.position.set(cx, cy+span*0.2, cz+span*1.2); camera.lookAt(cx,cy,cz);
+  }
   function centroid(poly){
     if(!poly || poly.length<3) return [0,0];
     let x=0,y=0,a=0;
@@ -337,6 +374,18 @@
     }
     if (Math.abs(a)<1e-9){ let sx=0,sy=0; for(const p of poly){sx+=p[0];sy+=p[1];} return [sx/poly.length, sy/poly.length]; }
     a*=0.5; x/=(6*a); y/=(6*a); return [x,y];
+  }
+  function makeArrow(){
+    const g = new THREE.PlaneGeometry(0.6,0.6);
+    const c = document.createElement('canvas'); c.width=256; c.height=256;
+    const ctx = c.getContext('2d');
+    ctx.strokeStyle='#fff'; ctx.lineWidth=16; ctx.lineCap='round'; ctx.lineJoin='round';
+    ctx.beginPath();
+    ctx.moveTo(128,32); ctx.lineTo(64,128); ctx.lineTo(104,128); ctx.lineTo(104,224);
+    ctx.lineTo(152,224); ctx.lineTo(152,128); ctx.lineTo(192,128); ctx.closePath(); ctx.stroke();
+    const tex = new THREE.CanvasTexture(c);
+    const m = new THREE.MeshBasicMaterial({map:tex, transparent:true, depthWrite:false});
+    return new THREE.Mesh(g,m);
   }
 })();
 </script>
