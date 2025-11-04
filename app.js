@@ -8,7 +8,7 @@ let selectedRoomId = null;
 let startPos = null; // {x, y} in floor image px
 let destPos = null;  // {x, y} centroid of room polygon
 
-let headingDeg = null; // 来自 DeviceOrientation alpha
+let headingDeg = null; // 来自 DeviceOrientation / webkitCompassHeading
 
 // ------- 初始化 -------
 window.addEventListener("DOMContentLoaded", () => {
@@ -29,7 +29,7 @@ async function loadAssets() {
   // 预加载平面图
   floorImg = await loadImage("Floor6.png");
 
-  // 设置 canvas 大小 = 图片大小，避免坐标缩放混乱
+  // canvas 尺寸与图片一致，坐标好算
   canvas.width = floorImg.width;
   canvas.height = floorImg.height;
 
@@ -37,7 +37,7 @@ async function loadAssets() {
   const roomsData = await fetch("./rooms_manual.json").then((r) => r.json());
   rooms = roomsData.rooms || roomsData;
 
-  // 加载 world -> floor 的仿射参数
+  // 加载 world -> floor 仿射参数
   worldParams = await fetch("./world_to_floor_params.json").then((r) => r.json());
 }
 
@@ -78,7 +78,6 @@ function setupUI() {
   // 点击画布设置当前位置
   canvas.addEventListener("click", (evt) => {
     const rect = canvas.getBoundingClientRect();
-    // 因为 canvas 的 CSS 宽度可能与实际宽度不同，需要算比例
     const scaleX = canvas.width / rect.width;
     const scaleY = canvas.height / rect.height;
 
@@ -147,7 +146,7 @@ function drawFloor() {
   }
 }
 
-// 多边形质心（简单平均，足够用）
+// 多边形质心（简单平均）
 function getRoomCentroid(room) {
   const pts = room.points;
   let sx = 0,
@@ -202,106 +201,27 @@ async function startAR() {
   const statusEl = document.getElementById("ar-status");
   const video = document.getElementById("camera");
 
+  // 摄像头
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: "environment" } },
       audio: false,
     });
     video.srcObject = stream;
-    statusEl.textContent = "摄像头已开启，旋转手机对准箭头指示方向。";
   } catch (err) {
     console.error(err);
     statusEl.textContent = "无法打开摄像头：" + err.message;
   }
 
-  // 设备方向（罗盘）
-  if (window.DeviceOrientationEvent) {
-    // iOS 13+ 需要权限
-    if (
-      typeof DeviceOrientationEvent.requestPermission === "function"
-    ) {
-      try {
-        const res = await DeviceOrientationEvent.requestPermission();
-        if (res !== "granted") {
-          statusEl.textContent = "未授权使用方向传感器。";
-          return;
-        }
-      } catch (e) {
-        statusEl.textContent = "请求方向传感器权限失败。";
-        console.error(e);
-        return;
-      }
-    }
-
-    window.addEventListener("deviceorientation", handleOrientation, true);
-  } else {
-    statusEl.textContent = "当前设备不支持 DeviceOrientation。";
+  // 方向传感器
+  try {
+    await initOrientationSensor();
+    statusEl.textContent = "传感器已开启，按照箭头方向前进。";
+  } catch (e) {
+    console.error(e);
+    statusEl.textContent = e.message || "方向传感器不可用。";
   }
 }
 
-function handleOrientation(evt) {
-  // alpha: 以正北为 0° 的方位角（大多数设备是这样，但各浏览器略有差异）
-  if (evt.absolute === true || evt.alpha != null) {
-    headingDeg = evt.alpha;
-    updateArrow();
-  }
-}
-
-function updateArrow() {
-  const arrowEl = document.getElementById("arrow");
-  const statusEl = document.getElementById("ar-status");
-
-  if (!startPos || !destPos) {
-    statusEl.textContent = "请先在平面图上设置当前位置与目标。";
-    return;
-  }
-  if (headingDeg == null) {
-    statusEl.textContent = "正在读取方向传感器…";
-    return;
-  }
-
-  // floor 平面坐标 → 方位角（0° 指向“上方/北”，顺时针为正）
-  const dx = destPos.x - startPos.x;
-  const dy = destPos.y - startPos.y;
-
-  // 画布 y 向下，所以这里用 -dy，让上方当成“北”
-  const bearingRad = Math.atan2(dx, -dy);
-  let bearingDeg = (bearingRad * 180) / Math.PI; // [-180,180]
-
-  if (bearingDeg < 0) bearingDeg += 360;
-
-  // 相对方向 = 目标方位角 - 手机朝向
-  let rel = bearingDeg - headingDeg;
-  // 归一化到 [-180,180]
-  rel = ((rel + 540) % 360) - 180;
-
-  arrowEl.style.transform = `translate(-50%, -50%) rotate(${rel}deg)`;
-
-  const distancePx = Math.hypot(dx, dy);
-  let distanceText = "";
-
-  if (worldParams && worldParams.meters_per_floor_px) {
-    const meters = distancePx * worldParams.meters_per_floor_px;
-    distanceText = `，约 ${meters.toFixed(1)} m`;
-  }
-
-  statusEl.textContent = `朝箭头方向前进${distanceText}`;
-}
-
-// ------- world 坐标 → floor 平面坐标（备用） -------
-// 使用 world_to_floor_params.json 里的 affine_M_2x3，实现一个工具函数
-function worldToFloor(x, y, z) {
-  if (!worldParams || !worldParams.affine_M_2x3) {
-    throw new Error("world_to_floor_params 未加载");
-  }
-  const M = worldParams.affine_M_2x3;
-  // 该文件 projection_mode = "FRONT_XZ"，所以用 X,Z → 平面
-  const u = x;
-  const v = z;
-  const px = M[0][0] * u + M[0][1] * v + M[0][2];
-  const py = M[1][0] * u + M[1][1] * v + M[1][2];
-  return { x: px, y: py };
-}
-
-// 你后续如果有 world 空间里的导航路径（例如从 sparse.ply / rooms_world.geojson 生成）
-// 可以：pointsWorld.map(p => worldToFloor(p.x, p.y, p.z)) 然后画在 floor-canvas 上。
+// 初始化 DeviceOrientation（兼容 iOS / Android）
+async func
