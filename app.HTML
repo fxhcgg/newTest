@@ -3,17 +3,20 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
-<title>两房间手动导航（同目录部署 · 修复TDZ）</title>
+<title>两房间手动导航（同目录部署 · 触控修复）</title>
 <style>
   html,body{margin:0;background:#000;overflow:hidden;touch-action:none;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
   #cam{position:fixed;left:0;top:0;width:100vw;height:100vh;object-fit:cover;background:#000;z-index:0;}
   #gl{position:fixed;left:0;top:0;width:100vw;height:100vh;z-index:1;pointer-events:none;}
   .panel{position:fixed;left:12px;right:12px;bottom:12px;z-index:3;background:rgba(0,0,0,.45);color:#fff;border-radius:12px;padding:10px 12px;backdrop-filter:blur(6px);}
+  /* 恢复控件交互：非常关键 */
+  .panel, .panel *{ touch-action:auto; pointer-events:auto; }
   .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
   select,button{font-size:12px;background:#111;color:#fff;border:1px solid #333;border-radius:8px;padding:6px 8px}
   .hud{position:fixed;left:12px;top:12px;z-index:3;background:rgba(0,0,0,.35);color:#fff;padding:8px 10px;border-radius:10px;font-size:12px;line-height:1.4}
   .diag{position:fixed;right:12px;top:12px;z-index:3;background:rgba(0,0,0,.5);color:#fff;padding:8px 10px;border-radius:10px;font-size:12px;line-height:1.5;max-width:46vw;}
   .ok{color:#7CFC00} .warn{color:#FFD700} .err{color:#FF6B6B}
+  .quick{display:flex;gap:6px;flex-wrap:wrap}
 </style>
 </head>
 <body>
@@ -40,22 +43,19 @@
     <button id="hDown">-0.2</button>
     <button id="hUp">+0.2</button>
   </div>
+  <div class="row quick" id="quickRow" style="display:none;"></div>
 </div>
 
 <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
 <script>
 (async function(){
-  const FILES = {
-    rooms: 'rooms_world.geojson',
-    plyPrimary: 'oriented.ply',
-    plyFallback: 'sparse.ply'
-  };
+  const FILES = { rooms:'rooms_world.geojson', plyPrimary:'oriented.ply', plyFallback:'sparse.ply' };
 
   const diag = document.getElementById('diag');
   function logLine(html){ diag.innerHTML += '<br>'+html; }
   function setLine(title, status, cls){ logLine(`<span class="${cls}">${title}: ${status}</span>`); }
 
-  // 1) 摄像头（失败不阻塞）
+  // 摄像头（失败不阻塞）
   try{
     const t0=performance.now();
     const stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ideal:'environment'} }, audio:false });
@@ -63,10 +63,9 @@
     setLine('Camera', `OK (${(performance.now()-t0|0)}ms)`, 'ok');
   }catch(e){
     setLine('Camera', 'FAILED（但继续加载 3D）', 'warn');
-    console.warn(e);
   }
 
-  // 2) Three.js
+  // Three.js
   const cnv = document.getElementById('gl');
   const renderer = new THREE.WebGLRenderer({canvas:cnv, antialias:true, alpha:true});
   renderer.setPixelRatio(window.devicePixelRatio||1);
@@ -76,26 +75,25 @@
   scene.add(new THREE.AmbientLight(0xffffff,1.0));
   const world = new THREE.Group(); scene.add(world);
 
-  // —— 把依赖的对象“提前初始化”，避免 TDZ —— //
+  // 依赖对象先初始化（防 TDZ）
   const roomsGroup = new THREE.Group(); world.add(roomsGroup);
   const pathLine = new THREE.Line(
     new THREE.BufferGeometry(),
     new THREE.LineDashedMaterial({color:0xffffff, dashSize:0.3, gapSize:0.15})
-  );
-  pathLine.computeLineDistances();
-  world.add(pathLine);
+  ); pathLine.computeLineDistances(); world.add(pathLine);
   const arrow = makeArrow(); world.add(arrow); arrow.visible=false;
 
-  // UI
+  // UI refs
   const hud = document.getElementById('hud');
   const selS = document.getElementById('start');
   const selE = document.getElementById('end');
   const btnHere = document.getElementById('iHere');
   const btnSwap = document.getElementById('swap');
   const yawMinus = document.getElementById('yawMinus');
-  const yawPlus = document.getElementById('yawPlus');
-  const hDown = document.getElementById('hDown');
-  const hUp = document.getElementById('hUp');
+  const yawPlus  = document.getElementById('yawPlus');
+  const hDown    = document.getElementById('hDown');
+  const hUp      = document.getElementById('hUp');
+  const quickRow = document.getElementById('quickRow');
 
   // 射线拾取地面
   const raycaster = new THREE.Raycaster();
@@ -108,7 +106,7 @@
   let userYawDeg = 0, userHeight = 1.6;
   let pcObj = null;
 
-  // 3) 加载 rooms（必须，同目录）
+  // 加载 rooms（同目录）
   try{
     const t0=performance.now();
     const r = await fetch(FILES.rooms, {cache:'no-store'});
@@ -120,19 +118,34 @@
       const poly=(f.geometry&&f.geometry.type==='Polygon')? f.geometry.coordinates[0] : [];
       return { id: prop.room_id ?? (i+1), name: prop.name ?? '', poly, centroid: centroid(poly) };
     });
-    drawRooms(rooms);  // <-- 现在 roomsGroup 已在上面初始化，安全
+    drawRooms(rooms);
+    // 填下拉
     rooms.forEach(r=>{
-      const o1=document.createElement('option'); o1.value=String(r.id); o1.textContent=`${r.id}${r.name?(' - '+r.name):''}`; selS.appendChild(o1);
-      const o2=document.createElement('option'); o2.value=String(r.id); o2.textContent=`${r.id}${r.name?(' - '+r.name):''}`; selE.appendChild(o2.cloneNode(true));
+      const opt1=document.createElement('option'); opt1.value=String(r.id); opt1.textContent=`${r.id}${r.name?(' - '+r.name):''}`; selS.appendChild(opt1);
+      const opt2=opt1.cloneNode(true); selE.appendChild(opt2);
     });
-    if (rooms.length===2){ selS.value=String(rooms[0].id); selE.value=String(rooms[1].id); applyRoomSelection(); }
+    // 两房间 → 默认互为起终 + 显示快捷按钮
+    if (rooms.length===2){
+      selS.value=String(rooms[0].id); selE.value=String(rooms[1].id); applyRoomSelection();
+      quickRow.style.display='';
+      quickRow.innerHTML = `
+        <button id="btnS1">起点=${rooms[0].name||rooms[0].id}</button>
+        <button id="btnS2">起点=${rooms[1].name||rooms[1].id}</button>
+        <button id="btnE1">终点=${rooms[0].name||rooms[0].id}</button>
+        <button id="btnE2">终点=${rooms[1].name||rooms[1].id}</button>
+      `;
+      document.getElementById('btnS1').onclick = ()=>{ selS.value=String(rooms[0].id); applyRoomSelection(); };
+      document.getElementById('btnS2').onclick = ()=>{ selS.value=String(rooms[1].id); applyRoomSelection(); };
+      document.getElementById('btnE1').onclick = ()=>{ selE.value=String(rooms[0].id); applyRoomSelection(); };
+      document.getElementById('btnE2').onclick = ()=>{ selE.value=String(rooms[1].id); applyRoomSelection(); };
+    }
     setLine('rooms_world.geojson', `OK (${(performance.now()-t0|0)}ms, rooms=${rooms.length})`, 'ok');
   }catch(e){
     setLine('rooms_world.geojson', `FAILED：${e.message||e}`, 'err');
     return;
   }
 
-  // 4) 加载点云（同目录，可选）
+  // 加载点云（可选）
   try{
     const t0=performance.now();
     let resp = await fetch(FILES.plyPrimary, {cache:'no-store'});
@@ -142,13 +155,8 @@
     const t1=performance.now();
     const pts = parsePLY(buf);
     const t2=performance.now();
-    if (pts.length){
-      addPointCloud(pts);
-      fitView(pts);
-      setLine('PLY', `OK (download ${(t1-t0|0)}ms, parse ${(t2-t1|0)}ms, points ${pts.length})`, 'ok');
-    } else {
-      setLine('PLY', 'EMPTY / PARSE ZERO', 'warn');
-    }
+    if (pts.length){ addPointCloud(pts); fitView(pts); setLine('PLY', `OK (download ${(t1-t0|0)}ms, parse ${(t2-t1|0)}ms, points ${pts.length})`, 'ok'); }
+    else setLine('PLY','EMPTY / PARSE ZERO','warn');
   }catch(e){
     setLine('PLY', `FAILED：${e.message||e}`, 'warn');
   }
@@ -167,11 +175,15 @@
 
   let waitingHere=false;
   btnHere.onclick = ()=>{ waitingHere=true; setLine('SetHere','点击地面 (y=0) 设起点','warn'); };
+  // 注意：画布 pointer-events:none，所以直接挂在 window 上
   window.addEventListener('pointerdown', (e)=>{
     if (!waitingHere) return;
     waitingHere=false;
-    pointer.x=(e.clientX/window.innerWidth)*2-1;
-    pointer.y=-(e.clientY/window.innerHeight)*2+1;
+    const rect = cnv.getBoundingClientRect();
+    // 转换到 canvas 坐标
+    const x = (e.clientX-rect.left)/rect.width;
+    const y = (e.clientY-rect.top)/rect.height;
+    pointer.x = x*2-1; pointer.y = - (y*2-1);
     raycaster.setFromCamera(pointer, camera);
     const hit=new THREE.Vector3();
     if (raycaster.ray.intersectPlane(groundPlane, hit)){
@@ -182,7 +194,7 @@
     } else {
       setLine('SetHere', '未命中 y=0 平面', 'warn');
     }
-  });
+  }, {passive:true});
 
   btnSwap.onclick = ()=>{ const tmp=selS.value; selS.value=selE.value; selE.value=tmp; applyRoomSelection(); };
   yawMinus.onclick = ()=> userYawDeg -= 5;
@@ -191,21 +203,16 @@
   hUp.onclick      = ()=> userHeight=Math.min(3.0, userHeight+0.2);
 
   // 渲染循环
-  function animate(){
-    requestAnimationFrame(animate);
-    updateArrow();
-    renderer.render(scene, camera);
-  }
+  function animate(){ requestAnimationFrame(animate); updateArrow(); renderer.render(scene, camera); }
   animate();
 
-  // 自适应
   window.addEventListener('resize', ()=>{
     camera.aspect = window.innerWidth/window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight, false);
   });
 
-  // ====== 绘制/工具函数 ======
+  // 绘制/工具
   function drawRooms(rs){
     roomsGroup.clear();
     const lineMat = new THREE.LineBasicMaterial({color:0x00A2FF});
@@ -241,6 +248,7 @@
 
   function updateArrow(){
     if (!endPos || !arrow.visible) return;
+    // 演示箭头：放在“相机前方 1m”，朝向终点；前方方向由手动 yaw 决定
     const yaw = THREE.MathUtils.degToRad(userYawDeg);
     const camPos = camera.position.clone();
     const forward = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
@@ -330,7 +338,6 @@
     if (Math.abs(a)<1e-9){ let sx=0,sy=0; for(const p of poly){sx+=p[0];sy+=p[1];} return [sx/poly.length, sy/poly.length]; }
     a*=0.5; x/=(6*a); y/=(6*a); return [x,y];
   }
-
 })();
 </script>
 </body>
