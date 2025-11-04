@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
-<title>两房间手动导航（静态跨平台）</title>
+<title>两房间手动导航（带自检）</title>
 <style>
   html,body{margin:0;background:#000;overflow:hidden;touch-action:none;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
   #cam{position:fixed;left:0;top:0;width:100vw;height:100vh;object-fit:cover;background:#000;z-index:0;}
@@ -12,14 +12,16 @@
   .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
   select,button{font-size:12px;background:#111;color:#fff;border:1px solid #333;border-radius:8px;padding:6px 8px}
   .hud{position:fixed;left:12px;top:12px;z-index:3;background:rgba(0,0,0,.35);color:#fff;padding:8px 10px;border-radius:10px;font-size:12px;line-height:1.4}
-  .tip{position:fixed;left:50%;transform:translateX(-50%);top:8px;z-index:3;background:rgba(0,0,0,.35);color:#fff;padding:6px 10px;border-radius:10px;font-size:12px}
+  .diag{position:fixed;right:12px;top:12px;z-index:3;background:rgba(0,0,0,.5);color:#fff;padding:8px 10px;border-radius:10px;font-size:12px;line-height:1.5;max-width:42vw;}
+  .ok{color:#7CFC00} .warn{color:#FFD700} .err{color:#FF6B6B}
 </style>
 </head>
 <body>
 <video id="cam" autoplay playsinline muted></video>
 <canvas id="gl"></canvas>
-<div class="tip" id="tip">加载中…</div>
+
 <div class="hud" id="hud">起点: N/A → 终点: N/A<br>距离: — m</div>
+<div class="diag" id="diag">加载中…</div>
 
 <div class="panel">
   <div class="row">
@@ -43,20 +45,29 @@
 <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
 <script>
 (async function(){
-  // 固定文件名（与 index.html 同目录）
+  // 固定文件（与 index.html 同目录）
   const FILES = {
     plyPrimary: 'oriented.ply',
     plyFallback: 'sparse.ply',
     rooms: 'rooms_world.geojson'
   };
 
-  // 摄像头背景（跨平台）
-  const camVideo = document.getElementById('cam');
-  navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ideal:'environment'} }, audio:false })
-    .then(stream=> camVideo.srcObject = stream)
-    .catch(()=> {}); // 摄像头失败也能看 3D 覆盖
+  const diag = document.getElementById('diag');
+  function logLine(html){ diag.innerHTML += '<br>'+html; }
+  function setLine(title, status, cls){ logLine(`<span class="${cls}">${title}: ${status}</span>`); }
 
-  // Three.js 基本
+  // 1) 摄像头（不成功也不阻塞）
+  try{
+    const t0=performance.now();
+    const stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ideal:'environment'} }, audio:false });
+    document.getElementById('cam').srcObject = stream;
+    setLine('Camera', `OK (${(performance.now()-t0|0)}ms)`, 'ok');
+  }catch(e){
+    setLine('Camera', 'FAILED（但继续加载 3D）', 'warn');
+    console.warn(e);
+  }
+
+  // 2) Three.js 初始化
   const cnv = document.getElementById('gl');
   const renderer = new THREE.WebGLRenderer({canvas:cnv, antialias:true, alpha:true});
   renderer.setPixelRatio(window.devicePixelRatio||1);
@@ -64,12 +75,9 @@
   const scene = new THREE.Scene(); scene.background = null;
   const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.01, 5000);
   scene.add(new THREE.AmbientLight(0xffffff,1.0));
+  const world = new THREE.Group(); scene.add(world);
 
-  const world = new THREE.Group(); scene.add(world); // 世界内容：米
-  let pcObj = null;
-
-  // UI
-  const tip = document.getElementById('tip');
+  // UI refs
   const hud = document.getElementById('hud');
   const selS = document.getElementById('start');
   const selE = document.getElementById('end');
@@ -83,91 +91,91 @@
   const pointer = new THREE.Vector2();
   const groundPlane = new THREE.Plane(new THREE.Vector3(0,1,0), 0);
 
-  function toast(s){ tip.textContent=s; tip.style.opacity='1'; clearTimeout(toast._t); toast._t=setTimeout(()=>tip.style.opacity='.6',1500); }
+  // 状态
+  let rooms = [];
+  let startPos = null, endPos = null;
+  let userYawDeg = 0, userHeight = 1.6;
+  let pcObj = null;
 
-  // 状态：两房间
-  let rooms = []; // {id,name,centroid:[x,y],poly:[[x,y]...]}
-  let startPos = null; // THREE.Vector3 (x,0,z)
-  let endPos = null;
-  let userYawDeg = 0; // 手动微调的朝向（非WebXR，纯演示箭头转向）
-  let userHeight = 1.6;
+  // 3) 加载 rooms（必须）
+  try{
+    const t0=performance.now();
+    const r = await fetch(FILES.rooms);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const gj = await r.json();
+    if (!gj || !gj.features) throw new Error('JSON 无 features');
+    rooms = gj.features.map((f,i)=>{
+      const prop=f.properties||{};
+      const poly=(f.geometry&&f.geometry.type==='Polygon')? f.geometry.coordinates[0] : [];
+      return { id: prop.room_id ?? (i+1), name: prop.name ?? '', poly, centroid: centroid(poly) };
+    });
+    drawRooms(rooms);
+    rooms.forEach(r=>{
+      const o1=document.createElement('option'); o1.value=String(r.id); o1.textContent=`${r.id}${r.name?(' - '+r.name):''}`; selS.appendChild(o1);
+      const o2=document.createElement('option'); o2.value=String(r.id); o2.textContent=`${r.id}${r.name?(' - '+r.name):''}`; selE.appendChild(o2.cloneNode(true));
+    });
+    if (rooms.length===2){ selS.value=String(rooms[0].id); selE.value=String(rooms[1].id); applyRoomSelection(); }
+    setLine('rooms_world.geojson', `OK (${(performance.now()-t0|0)}ms, rooms=${rooms.length})`, 'ok');
+  }catch(e){
+    setLine('rooms_world.geojson', `FAILED：${e.message||e}`, 'err');
+    return; // 没房间就不继续
+  }
+
+  // 4) 加载点云（可选）
+  try{
+    const t0=performance.now();
+    let resp = await fetch(FILES.plyPrimary);
+    if (!resp.ok) resp = await fetch(FILES.plyFallback);
+    if (!resp.ok) throw new Error(`not found: ${FILES.plyPrimary} / ${FILES.plyFallback}`);
+    const buf = await resp.arrayBuffer();
+    const t1=performance.now();
+    const pts = parsePLY(buf);
+    const t2=performance.now();
+    if (pts.length){
+      addPointCloud(pts);
+      fitView(pts);
+      setLine('PLY', `OK (download ${(t1-t0|0)}ms, parse ${(t2-t1|0)}ms, points ${pts.length})`, 'ok');
+    } else {
+      setLine('PLY', 'EMPTY / PARSE ZERO', 'warn');
+    }
+  }catch(e){
+    setLine('PLY', `FAILED：${e.message||e}`, 'warn');
+  }
+
+  // —— 交互 —— //
+  selS.onchange = applyRoomSelection;
+  selE.onchange = applyRoomSelection;
+
+  btnHere.onclick = ()=>{ waitingHere=true; setLine('SetHere','Tap on ground plane (y=0)','warn'); };
+  let waitingHere=false;
+  window.addEventListener('pointerdown', (e)=>{
+    if (!waitingHere) return;
+    waitingHere=false;
+    pointer.x=(e.clientX/window.innerWidth)*2-1;
+    pointer.y=-(e.clientY/window.innerHeight)*2+1;
+    raycaster.setFromCamera(pointer, camera);
+    const hit=new THREE.Vector3();
+    if (raycaster.ray.intersectPlane(groundPlane, hit)){
+      startPos = new THREE.Vector3(hit.x,0,hit.z);
+      selS.value="";
+      updatePathAndHUD();
+      setLine('SetHere', `OK @ (${hit.x.toFixed(2)}, ${hit.z.toFixed(2)})`, 'ok');
+    } else {
+      setLine('SetHere', 'No intersection with y=0', 'warn');
+    }
+  });
+
+  btnSwap.onclick = ()=>{ const tmp=selS.value; selS.value=selE.value; selE.value=tmp; applyRoomSelection(); };
+  yawMinus.onclick = ()=> userYawDeg -= 5;
+  yawPlus.onclick  = ()=> userYawDeg += 5;
+  hDown.onclick    = ()=> userHeight=Math.max(0.8, userHeight-0.2);
+  hUp.onclick      = ()=> userHeight=Math.min(3.0, userHeight+0.2);
 
   // 画房间/路径/箭头
   const roomsGroup = new THREE.Group(); world.add(roomsGroup);
   const pathLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineDashedMaterial({color:0xffffff, dashSize:0.3, gapSize:0.15}));
   pathLine.computeLineDistances(); world.add(pathLine);
   const arrow = makeArrow(); world.add(arrow); arrow.visible=false;
-
-  // —— 加载 rooms —— //
-  const gj = await fetchMaybe(FILES.rooms).then(r=>r?.json()).catch(()=>null);
-  if (gj && gj.features) {
-    rooms = gj.features.map((f,i)=>{
-      const prop = f.properties||{};
-      const poly = (f.geometry && f.geometry.type==='Polygon') ? f.geometry.coordinates[0] : [];
-      return { id: prop.room_id ?? (i+1), name: prop.name ?? '', poly, centroid: centroid(poly) };
-    });
-    drawRooms(rooms);
-    // 填充下拉
-    rooms.forEach(r=>{
-      const o1=document.createElement('option'); o1.value=String(r.id); o1.textContent=`${r.id}${r.name?(' - '+r.name):''}`; selS.appendChild(o1);
-      const o2=document.createElement('option'); o2.value=String(r.id); o2.textContent=`${r.id}${r.name?(' - '+r.name):''}`; selE.appendChild(o2.cloneNode(true));
-    });
-    // 若只有两个房间，默认选起/终
-    if (rooms.length===2){ selS.value=String(rooms[0].id); selE.value=String(rooms[1].id); applyRoomSelection(); }
-  } else {
-    toast('未找到 rooms_world.geojson 或解析失败');
-  }
-
-  // —— 加载点云（可选） —— //
-  const plyResp = await fetchMaybe(FILES.plyPrimary) || await fetchMaybe(FILES.plyFallback);
-  if (plyResp) {
-    const buf = await plyResp.arrayBuffer();
-    const pts = parsePLY(buf);
-    if (pts.length){ addPointCloud(pts); fitView(pts); toast('点云已加载'); }
-  }
-
-  // 下拉选择
-  selS.onchange = applyRoomSelection;
-  selE.onchange = applyRoomSelection;
-  function applyRoomSelection(){
-    const s = rooms.find(r=> String(r.id)===selS.value);
-    const e = rooms.find(r=> String(r.id)===selE.value);
-    startPos = s ? new THREE.Vector3(s.centroid[0], 0, s.centroid[1]) : null;
-    endPos   = e ? new THREE.Vector3(e.centroid[0], 0, e.centroid[1]) : null;
-    updatePathAndHUD();
-  }
-
-  // 我在这（点地面设起点）
-  let waitingHere=false;
-  btnHere.onclick = ()=>{ waitingHere=true; toast('点击地面 y=0 设“起点”'); };
-  window.addEventListener('pointerdown', (e)=>{
-    if (!waitingHere) return;
-    waitingHere = false;
-    pointer.x = (e.clientX/window.innerWidth)*2 - 1;
-    pointer.y = -(e.clientY/window.innerHeight)*2 + 1;
-    raycaster.setFromCamera(pointer, camera);
-    const hit = new THREE.Vector3();
-    if (raycaster.ray.intersectPlane(groundPlane, hit)) {
-      startPos = new THREE.Vector3(hit.x, 0, hit.z);
-      selS.value = ""; // 置空“起点房间”
-      updatePathAndHUD();
-      toast(`起点已设为 (${hit.x.toFixed(2)}, ${hit.z.toFixed(2)})`);
-    } else {
-      toast('没有点到地面（y=0）');
-    }
-  });
-
-  // 交换起终
-  btnSwap.onclick = ()=>{
-    const tmp = selS.value; selS.value = selE.value; selE.value = tmp;
-    applyRoomSelection();
-  };
-
-  // 朝向/高度微调（控制前方箭头的朝向与高度）
-  document.getElementById('yawMinus').onclick = ()=> userYawDeg -= 5;
-  document.getElementById('yawPlus').onclick  = ()=> userYawDeg += 5;
-  document.getElementById('hDown').onclick    = ()=> { userHeight=Math.max(0.8, userHeight-0.2); };
-  document.getElementById('hUp').onclick      = ()=> { userHeight=Math.min(3.0, userHeight+0.2); };
 
   // 主循环
   function animate(){
@@ -184,8 +192,7 @@
     renderer.setSize(window.innerWidth, window.innerHeight, false);
   });
 
-  // —— 工具函数 —— //
-  function fetchMaybe(url){ return fetch(url).then(r=>r.ok?r:null).catch(()=>null); }
+  // ====== helpers ======
   function centroid(poly){
     if(!poly || poly.length<3) return [0,0];
     let x=0,y=0,a=0;
@@ -211,6 +218,48 @@
       const mesh = new THREE.Mesh(geo, fillMat); mesh.rotation.x=-Math.PI/2; mesh.position.y=up;
       roomsGroup.add(mesh);
     });
+  }
+  function applyRoomSelection(){
+    const s = rooms.find(r=> String(r.id)===selS.value);
+    const e = rooms.find(r=> String(r.id)===selE.value);
+    startPos = s ? new THREE.Vector3(s.centroid[0], 0, s.centroid[1]) : null;
+    endPos   = e ? new THREE.Vector3(e.centroid[0], 0, e.centroid[1]) : null;
+    updatePathAndHUD();
+  }
+  function updatePathAndHUD(){
+    const geo = new THREE.BufferGeometry();
+    const pts = [];
+    if (startPos) pts.push(new THREE.Vector3(startPos.x, 0.05, startPos.z));
+    if (endPos)   pts.push(new THREE.Vector3(endPos.x,   0.05, endPos.z));
+    geo.setFromPoints(pts);
+    pathLine.geometry.dispose(); pathLine.geometry = geo;
+    pathLine.computeLineDistances();
+    let dist='—';
+    if (startPos && endPos) dist = startPos.clone().setY(0).distanceTo(endPos.clone().setY(0)).toFixed(2);
+    hud.innerHTML = `起点: ${startPos?`${startPos.x.toFixed(2)},${startPos.z.toFixed(2)}`:'N/A'} → 终点: ${endPos?`${endPos.x.toFixed(2)},${endPos.z.toFixed(2)}`:'N/A'}<br>距离: ${dist} m`;
+    arrow.visible = !!endPos;
+  }
+  function updateArrow(){
+    if (!endPos || !arrow.visible) return;
+    const yaw = THREE.MathUtils.degToRad(userYawDeg);
+    const camPos = camera.position.clone();
+    const forward = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
+    const pos = camPos.clone().addScaledVector(forward, 1.0); pos.y = userHeight;
+    arrow.position.copy(pos);
+    const target = new THREE.Vector3(endPos.x, pos.y, endPos.z);
+    arrow.lookAt(target);
+  }
+  function makeArrow(){
+    const g = new THREE.PlaneGeometry(0.6,0.6);
+    const c = document.createElement('canvas'); c.width=256; c.height=256;
+    const ctx = c.getContext('2d');
+    ctx.strokeStyle='#fff'; ctx.lineWidth=16; ctx.lineCap='round'; ctx.lineJoin='round';
+    ctx.beginPath();
+    ctx.moveTo(128,32); ctx.lineTo(64,128); ctx.lineTo(104,128); ctx.lineTo(104,224);
+    ctx.lineTo(152,224); ctx.lineTo(152,128); ctx.lineTo(192,128); ctx.closePath(); ctx.stroke();
+    const tex = new THREE.CanvasTexture(c);
+    const m = new THREE.MeshBasicMaterial({map:tex, transparent:true, depthWrite:false});
+    return new THREE.Mesh(g,m);
   }
   function addPointCloud(points){
     if (pcObj){ world.remove(pcObj); pcObj.geometry.dispose(); }
@@ -265,45 +314,6 @@
     for(const p of points){ const [x,y,z]=p; if(x<minX)minX=x; if(y<minY)minY=y; if(z<minZ)minZ=z; if(x>maxX)maxX=x; if(y>maxY)maxY=y; if(z>maxZ)maxZ=z; }
     const cx=(minX+maxX)/2, cy=(minY+maxY)/2, cz=(minZ+maxZ)/2; const span=Math.max(maxX-minX,maxY-minY,maxZ-minZ);
     camera.position.set(cx, cy+span*0.2, cz+span*1.2); camera.lookAt(cx,cy,cz);
-  }
-  function makeArrow(){
-    const g = new THREE.PlaneGeometry(0.6,0.6);
-    const c = document.createElement('canvas'); c.width=256; c.height=256;
-    const ctx = c.getContext('2d');
-    ctx.strokeStyle='#fff'; ctx.lineWidth=16; ctx.lineCap='round'; ctx.lineJoin='round';
-    ctx.beginPath();
-    ctx.moveTo(128,32); ctx.lineTo(64,128); ctx.lineTo(104,128); ctx.lineTo(104,224);
-    ctx.lineTo(152,224); ctx.lineTo(152,128); ctx.lineTo(192,128); ctx.closePath(); ctx.stroke();
-    const tex = new THREE.CanvasTexture(c);
-    const m = new THREE.MeshBasicMaterial({map:tex, transparent:true, depthWrite:false});
-    return new THREE.Mesh(g,m);
-  }
-  function updatePathAndHUD(){
-    // 路径线
-    const geo = new THREE.BufferGeometry();
-    const pts = [];
-    if (startPos) pts.push(new THREE.Vector3(startPos.x, 0.05, startPos.z));
-    if (endPos)   pts.push(new THREE.Vector3(endPos.x,   0.05, endPos.z));
-    if (pts.length>=2){ geo.setFromPoints(pts); pathLine.geometry.dispose(); pathLine.geometry = geo; pathLine.computeLineDistances(); }
-    else { geo.setFromPoints([]); pathLine.geometry.dispose(); pathLine.geometry = geo; }
-    // HUD
-    let dist = '—';
-    if (startPos && endPos) dist = startPos.clone().setY(0).distanceTo(endPos.clone().setY(0)).toFixed(2);
-    hud.innerHTML = `起点: ${startPos?`${startPos.x.toFixed(2)},${startPos.z.toFixed(2)}`:'N/A'} → 终点: ${endPos?`${endPos.x.toFixed(2)},${endPos.z.toFixed(2)}`:'N/A'}<br>距离: ${dist} m`;
-    // 箭头显示
-    arrow.visible = !!endPos;
-  }
-  function updateArrow(){
-    if (!endPos || !arrow.visible) return;
-    // 箭头放在“相机前方 1m，高度 userHeight”，方向指向终点（纯演示：用手动 yaw 来决定“前方”）
-    const yaw = THREE.MathUtils.degToRad(userYawDeg);
-    // 相机位（用Three摄像机位置，不跟随真实世界）
-    const camPos = camera.position.clone();
-    const forward = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
-    const pos = camPos.clone().addScaledVector(forward, 1.0); pos.y = userHeight;
-    arrow.position.copy(pos);
-    const target = new THREE.Vector3(endPos.x, pos.y, endPos.z);
-    arrow.lookAt(target);
   }
 })();
 </script>
