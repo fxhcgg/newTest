@@ -9,6 +9,7 @@ let startPos = null; // {x, y} in floor image px
 let destPos = null;  // {x, y} centroid of room polygon
 
 let headingDeg = null; // 设备朝向（0 = 北）
+let orientationListening = false; // 防止重复注册监听
 
 // ------- 初始化 -------
 window.addEventListener("DOMContentLoaded", () => {
@@ -28,6 +29,7 @@ window.addEventListener("DOMContentLoaded", () => {
 async function loadAssets() {
   floorImg = await loadImage("Floor6.png");
 
+  // canvas 尺寸与图片一致，坐标好算
   canvas.width = floorImg.width;
   canvas.height = floorImg.height;
 
@@ -70,6 +72,7 @@ function setupUI() {
     drawFloor();
   });
 
+  // 点击画布设置当前位置
   canvas.addEventListener("click", (evt) => {
     const rect = canvas.getBoundingClientRect();
     const scaleX = canvas.width / rect.width;
@@ -161,12 +164,14 @@ function setupTabs() {
   });
 }
 
-// ------- AR 主流程 -------
+// ------- AR 按钮 & 主流程 -------
 function setupARButton() {
-  document.getElementById("start-ar").addEventListener("click", startAR);
+  const btn = document.getElementById("start-ar");
+  // 关键点：requestPermission 必须在这个点击回调里调用
+  btn.addEventListener("click", onStartARClick);
 }
 
-async function startAR() {
+async function onStartARClick() {
   const statusEl = document.getElementById("ar-status");
 
   if (!startPos || !destPos) {
@@ -174,7 +179,7 @@ async function startAR() {
     return;
   }
 
-  // 切换到 AR tab
+  // 先切换到 AR tab（同步操作，不影响权限弹窗）
   document
     .querySelectorAll(".tab-button")
     .forEach((b) => b.classList.toggle("active", b.dataset.tab === "ar-tab"));
@@ -182,7 +187,36 @@ async function startAR() {
     .querySelectorAll(".tab-content")
     .forEach((c) => c.classList.toggle("active", c.id === "ar-tab"));
 
-  // 打开摄像头
+  // -------- 1. 请求方向传感器权限（iOS 13+ 必须在点击回调里直接调用） --------
+  let sensorSupported = typeof DeviceOrientationEvent !== "undefined";
+  let sensorPermissionOk = true;
+
+  if (!sensorSupported) {
+    sensorPermissionOk = false;
+    statusEl.textContent = "当前浏览器不支持 DeviceOrientation 方向传感器。";
+  } else if (
+    typeof DeviceOrientationEvent.requestPermission === "function"
+  ) {
+    // iOS / iPadOS 专用流程
+    try {
+      const res = await DeviceOrientationEvent.requestPermission();
+      if (res !== "granted") {
+        sensorPermissionOk = false;
+        statusEl.textContent =
+          "已拒绝方向传感器权限，请在 Safari 网站设置中允许“运动与方向访问”。";
+      }
+    } catch (e) {
+      console.warn("DeviceOrientationEvent.requestPermission error:", e);
+      sensorPermissionOk = false;
+      statusEl.textContent =
+        "请求方向传感器权限失败，请确认使用 Safari 且允许“运动与方向访问”。";
+    }
+  } else {
+    // 没有 requestPermission（Android / 老版本 iOS），后面直接监听事件即可
+    sensorPermissionOk = true;
+  }
+
+  // -------- 2. 打开摄像头 --------
   const video = document.getElementById("camera");
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -195,43 +229,27 @@ async function startAR() {
     statusEl.textContent = "无法打开摄像头：" + err.message;
   }
 
-  // 初始化方向传感器
-  try {
-    await initOrientationSensor();
-    statusEl.textContent = "传感器已开启，按照箭头方向前进。";
-  } catch (e) {
-    console.error("initOrientationSensor error", e);
-    statusEl.textContent = e.message || "方向传感器不可用。";
+  // -------- 3. 注册方向事件监听 --------
+  if (sensorSupported) {
+    startOrientationListener();
+    // 简单做一个 3 秒检测：如果 3 秒后还没有任何 heading 数据，就提示可能被系统禁用
+    headingDeg = null;
+    setTimeout(() => {
+      if (headingDeg == null) {
+        statusEl.textContent =
+          "未能获取方向数据，可能浏览器禁用了传感器。请在系统/浏览器设置中检查。";
+      }
+    }, 3000);
   }
 }
 
-// ------- 方向传感器初始化（iOS & Android） -------
-async function initOrientationSensor() {
-  if (typeof DeviceOrientationEvent === "undefined") {
-    throw new Error("当前浏览器不支持方向传感器（DeviceOrientation）。");
-  }
+// ------- 注册方向监听（iOS & Android 通用） -------
+function startOrientationListener() {
+  if (orientationListening) return; // 防止重复注册
+  orientationListening = true;
 
-  // iOS / iPadOS 13+ & iOS 上的 Chrome 都会有这个方法
-  if (typeof DeviceOrientationEvent.requestPermission === "function") {
-    try {
-      const res = await DeviceOrientationEvent.requestPermission();
-      if (res !== "granted") {
-        throw new Error(
-          "已拒绝方向传感器权限。请在 iOS 设置和 Safari 网站设置中允许“运动与方向访问”。"
-        );
-      }
-    } catch (err) {
-      // 即便出错，也尝试继续监听，有些环境会返回错误但仍然能触发事件
-      console.warn("requestPermission 出错：", err);
-      window.addEventListener("deviceorientation", handleOrientation, true);
-      throw new Error(
-        "请求方向传感器权限失败，请检查：\n1. 使用 https 页面\n2. iOS 设置中开启“运动与方向访问”\n3. Safari 网站设置允许传感器。"
-      );
-    }
-  }
-
-  // 优先使用 absolute 事件
   if ("ondeviceorientationabsolute" in window) {
+    // 部分 Android 浏览器提供绝对方向事件
     window.addEventListener(
       "deviceorientationabsolute",
       handleOrientation,
@@ -247,14 +265,14 @@ function handleOrientation(evt) {
   const statusEl = document.getElementById("ar-status");
   let heading;
 
-  // iOS: webkitCompassHeading 是已经校正了磁北的角度
+  // iOS: webkitCompassHeading = 已经校正磁北的角度，0 = 北，顺时针增加
   if (typeof evt.webkitCompassHeading === "number") {
     heading = evt.webkitCompassHeading;
   } else if (evt.absolute && typeof evt.alpha === "number") {
-    // 部分 Android: alpha = 绝对方位角
+    // 一些 Android: alpha 直接是相对于正北
     heading = evt.alpha;
   } else if (typeof evt.alpha === "number") {
-    // 最后退路：alpha，相对方位角（可能不精确）
+    // 退一步：相对方向，也能用（可能会有漂移）
     heading = evt.alpha;
   } else {
     statusEl.textContent =
@@ -283,14 +301,15 @@ function updateArrow() {
   const dx = destPos.x - startPos.x;
   const dy = destPos.y - startPos.y;
 
-  // 画布坐标 y 向下，所以用 -dy，让上方当作“北”
+  // 画布 y 向下，所以用 -dy，把“上方”当作北
   const bearingRad = Math.atan2(dx, -dy);
   let bearingDeg = (bearingRad * 180) / Math.PI;
   if (bearingDeg < 0) bearingDeg += 360;
 
   // 相对角度（让箭头指向目的地）
   let rel = bearingDeg - headingDeg;
-  rel = ((rel + 540) % 360) - 180; // 归一化到 [-180, 180]
+  // 归一化到 [-180, 180]
+  rel = ((rel + 540) % 360) - 180;
 
   arrowEl.style.transform = `translate(-50%, -50%) rotate(${rel}deg)`;
 
@@ -310,7 +329,7 @@ function worldToFloor(x, y, z) {
     throw new Error("world_to_floor_params 未加载");
   }
   const M = worldParams.affine_M_2x3;
-  const u = x; // FRONT_XZ：用 X,Z
+  const u = x; // projection_mode = FRONT_XZ：用 X,Z
   const v = z;
   const px = M[0][0] * u + M[0][1] * v + M[0][2];
   const py = M[1][0] * u + M[1][1] * v + M[1][2];
