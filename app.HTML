@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
-<title>Marker AR 导航（iOS+Android 双平台，无 WebXR）</title>
+<title>两房间手动导航（静态跨平台）</title>
 <style>
   html,body{margin:0;background:#000;overflow:hidden;touch-action:none;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
   #cam{position:fixed;left:0;top:0;width:100vw;height:100vh;object-fit:cover;background:#000;z-index:0;}
@@ -19,47 +19,44 @@
 <video id="cam" autoplay playsinline muted></video>
 <canvas id="gl"></canvas>
 <div class="tip" id="tip">加载中…</div>
-<div class="hud" id="hud">markers: 0 | pose: N/A</div>
+<div class="hud" id="hud">起点: N/A → 终点: N/A<br>距离: — m</div>
+
 <div class="panel">
   <div class="row">
-    <label>目标房间</label>
-    <select id="room"><option value="">未选择</option></select>
-    <button id="clear">清除</button>
-    <button id="recenter">重置对齐</button>
+    <label>起点</label>
+    <select id="start"><option value="">未选择</option></select>
+    <label>终点</label>
+    <select id="end"><option value="">未选择</option></select>
+    <button id="iHere">我在这（点地面）</button>
+    <button id="swap">交换起终</button>
+  </div>
+  <div class="row">
+    <label>朝向微调</label>
+    <button id="yawMinus">-5°</button>
+    <button id="yawPlus">+5°</button>
+    <label>高度(m)</label>
+    <button id="hDown">-0.2</button>
+    <button id="hUp">+0.2</button>
   </div>
 </div>
 
-<!-- Three.js -->
 <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
-<!-- OpenCV.js（ArUco 支持） -->
-<script async src="https://docs.opencv.org/4.x/opencv.js" type="text/javascript"></script>
-
 <script>
 (async function(){
-  // -------- 固定文件名（与 index.html 同目录） --------
+  // 固定文件名（与 index.html 同目录）
   const FILES = {
-    ply: 'oriented.ply',            // 若没有就换成 sparse.ply
-    rooms: 'rooms_world.geojson',   // 世界坐标(米)
-    markers: 'markers_world.json'   // 标记世界位姿配置
+    plyPrimary: 'oriented.ply',
+    plyFallback: 'sparse.ply',
+    rooms: 'rooms_world.geojson'
   };
 
-  // --------- UI refs ----------
-  const tip = document.getElementById('tip');
-  const hud = document.getElementById('hud');
-  const roomSel = document.getElementById('room');
-  const btnClear = document.getElementById('clear');
-  const btnRecenter = document.getElementById('recenter');
-
-  function toast(s){ tip.textContent=s; tip.style.opacity='1'; clearTimeout(toast._t); toast._t=setTimeout(()=>tip.style.opacity='.6',1500); }
-
-  // --------- Camera ----------
+  // 摄像头背景（跨平台）
   const camVideo = document.getElementById('cam');
-  const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}}, audio:false})
-    .catch(e=>{toast('相机权限失败'); throw e;});
-  camVideo.srcObject = stream;
-  await camVideo.play();
+  navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ideal:'environment'} }, audio:false })
+    .then(stream=> camVideo.srcObject = stream)
+    .catch(()=> {}); // 摄像头失败也能看 3D 覆盖
 
-  // --------- Three.js ----------
+  // Three.js 基本
   const cnv = document.getElementById('gl');
   const renderer = new THREE.WebGLRenderer({canvas:cnv, antialias:true, alpha:true});
   renderer.setPixelRatio(window.devicePixelRatio||1);
@@ -68,168 +65,127 @@
   const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.01, 5000);
   scene.add(new THREE.AmbientLight(0xffffff,1.0));
 
-  // “世界内容”放在 worldGroup，坐标单位=米
-  const worldGroup = new THREE.Group(); worldGroup.matrixAutoUpdate = false;
-  scene.add(worldGroup);
+  const world = new THREE.Group(); scene.add(world); // 世界内容：米
+  let pcObj = null;
 
-  // 箭头（看向目标）
-  const arrow = makeBillboardArrow(); arrow.visible=false; worldGroup.add(arrow);
+  // UI
+  const tip = document.getElementById('tip');
+  const hud = document.getElementById('hud');
+  const selS = document.getElementById('start');
+  const selE = document.getElementById('end');
+  const btnHere = document.getElementById('iHere');
+  const btnSwap = document.getElementById('swap');
+  const yawMinus = document.getElementById('yawMinus');
+  const yawPlus = document.getElementById('yawPlus');
+  const hDown = document.getElementById('hDown');
+  const hUp = document.getElementById('hUp');
+  const raycaster = new THREE.Raycaster();
+  const pointer = new THREE.Vector2();
+  const groundPlane = new THREE.Plane(new THREE.Vector3(0,1,0), 0);
 
-  // --------- 数据加载 ----------
-  async function fetchMaybe(url){ try{ const r=await fetch(url); if(!r.ok) return null; return r; }catch{ return null; } }
-  // rooms
-  const roomsGJ = await (await fetchMaybe(FILES.rooms))?.json();
+  function toast(s){ tip.textContent=s; tip.style.opacity='1'; clearTimeout(toast._t); toast._t=setTimeout(()=>tip.style.opacity='.6',1500); }
+
+  // 状态：两房间
   let rooms = []; // {id,name,centroid:[x,y],poly:[[x,y]...]}
-  if (roomsGJ && roomsGJ.features) {
-    rooms = roomsGJ.features.map((f,i)=>{
-      const prop=f.properties||{};
-      const poly=(f.geometry&&f.geometry.type==='Polygon')? f.geometry.coordinates[0] : [];
+  let startPos = null; // THREE.Vector3 (x,0,z)
+  let endPos = null;
+  let userYawDeg = 0; // 手动微调的朝向（非WebXR，纯演示箭头转向）
+  let userHeight = 1.6;
+
+  // 画房间/路径/箭头
+  const roomsGroup = new THREE.Group(); world.add(roomsGroup);
+  const pathLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineDashedMaterial({color:0xffffff, dashSize:0.3, gapSize:0.15}));
+  pathLine.computeLineDistances(); world.add(pathLine);
+  const arrow = makeArrow(); world.add(arrow); arrow.visible=false;
+
+  // —— 加载 rooms —— //
+  const gj = await fetchMaybe(FILES.rooms).then(r=>r?.json()).catch(()=>null);
+  if (gj && gj.features) {
+    rooms = gj.features.map((f,i)=>{
+      const prop = f.properties||{};
+      const poly = (f.geometry && f.geometry.type==='Polygon') ? f.geometry.coordinates[0] : [];
       return { id: prop.room_id ?? (i+1), name: prop.name ?? '', poly, centroid: centroid(poly) };
     });
-    addRooms(worldGroup, rooms);
-    rooms.forEach(r=> {
-      const opt=document.createElement('option');
-      opt.value=String(r.id); opt.textContent = `${r.id}${r.name?(' - '+r.name):''}`;
-      roomSel.appendChild(opt);
+    drawRooms(rooms);
+    // 填充下拉
+    rooms.forEach(r=>{
+      const o1=document.createElement('option'); o1.value=String(r.id); o1.textContent=`${r.id}${r.name?(' - '+r.name):''}`; selS.appendChild(o1);
+      const o2=document.createElement('option'); o2.value=String(r.id); o2.textContent=`${r.id}${r.name?(' - '+r.name):''}`; selE.appendChild(o2.cloneNode(true));
     });
+    // 若只有两个房间，默认选起/终
+    if (rooms.length===2){ selS.value=String(rooms[0].id); selE.value=String(rooms[1].id); applyRoomSelection(); }
   } else {
-    toast('rooms_world.geojson 缺失或解析失败');
+    toast('未找到 rooms_world.geojson 或解析失败');
   }
-  // target
-  let targetPos = null;
-  roomSel.onchange = ()=>{
-    const val = roomSel.value; if(!val){ targetPos=null; arrow.visible=false; return; }
-    const r = rooms.find(x=> String(x.id)===val);
-    if (r){ targetPos = new THREE.Vector3(r.centroid[0], 0, r.centroid[1]); arrow.visible=true; }
-  };
-  btnClear.onclick = ()=>{ roomSel.value=''; targetPos=null; arrow.visible=false; };
 
-  // point cloud
-  const plyResp = await fetchMaybe(FILES.ply) || await fetchMaybe('sparse.ply');
+  // —— 加载点云（可选） —— //
+  const plyResp = await fetchMaybe(FILES.plyPrimary) || await fetchMaybe(FILES.plyFallback);
   if (plyResp) {
     const buf = await plyResp.arrayBuffer();
     const pts = parsePLY(buf);
-    if (pts.length) addPointCloud(worldGroup, pts);
-  } else {
-    toast('未找到 PLY');
+    if (pts.length){ addPointCloud(pts); fitView(pts); toast('点云已加载'); }
   }
 
-  // markers config
-  // markers_world.json 样例：
-  // {
-  //   "aruco_dict": "DICT_4X4_50",
-  //   "marker_size_m": 0.14,
-  //   "markers": [
-  //     {"id": 7, "pos": [12.34, 0.00, 5.67], "yaw_deg": 90},
-  //     {"id": 12, "pos": [3.2, 0.00, 18.9], "yaw_deg": 0}
-  //   ]
-  // }
-  const markerCfg = await (await fetchMaybe(FILES.markers))?.json();
-  if (!markerCfg) toast('未找到 markers_world.json（可先上墙1~2个标记）');
+  // 下拉选择
+  selS.onchange = applyRoomSelection;
+  selE.onchange = applyRoomSelection;
+  function applyRoomSelection(){
+    const s = rooms.find(r=> String(r.id)===selS.value);
+    const e = rooms.find(r=> String(r.id)===selE.value);
+    startPos = s ? new THREE.Vector3(s.centroid[0], 0, s.centroid[1]) : null;
+    endPos   = e ? new THREE.Vector3(e.centroid[0], 0, e.centroid[1]) : null;
+    updatePathAndHUD();
+  }
 
-  // --------- OpenCV.js 初始化（ArUco）----------
-  await cvReady();
-  const dict = getArucoDict((markerCfg && markerCfg.aruco_dict) || 'DICT_4X4_50');
-  const params = new cv.DetectorParameters();
-  const camMat = cameraMatrixFromFOV(camVideo.videoWidth, camVideo.videoHeight, 60); // 用 FOV 估相机内参
-  const distCoeffs = cv.Mat.zeros(1,5,cv.CV_64F); // 先当无畸变
-
-  // 画面缓冲
-  const capCanvas = document.createElement('canvas');
-  capCanvas.width = camVideo.videoWidth; capCanvas.height = camVideo.videoHeight;
-  const capCtx = capCanvas.getContext('2d');
-
-  // 位姿状态（XR风格：相机在世界系中的位姿）
-  let havePose = false;
-  let camWorld_R = new THREE.Matrix4();  // 3x3旋转（扩展为4x4）
-  let camWorld_t = new THREE.Vector3();  // 平移
-  // 将“世界内容”放入相机坐标 → 可反过来（把相机放世界），我们用等效变换：计算 worldGroup.matrix = cam->world 的逆
-  // 这里我们直接算 world->camera，再取逆
-
-  // 重置
-  btnRecenter.onclick = ()=>{ havePose=false; };
-
-  // --------- 渲染+跟踪主循环 ----------
-  function loop(){
-    requestAnimationFrame(loop);
-
-    // 抓一帧
-    capCtx.drawImage(camVideo, 0, 0, capCanvas.width, capCanvas.height);
-    const src = cv.imread(capCanvas);
-
-    // 检测 ArUco
-    const corners = new cv.MatVector();
-    const ids = new cv.Mat();
-    cv.detectMarkers(src, dict, corners, ids, params);
-
-    let nMarkers = 0;
-    if (!ids.empty() && markerCfg && markerCfg.markers && markerCfg.markers.length) {
-      const size = (markerCfg.marker_size_m || 0.14); // 每个标记边长（米）
-      // 收集匹配到的世界锚点与相机观测的 rvec/tvec
-      const obs = []; // {id, rvec, tvec, worldPoseOfMarker}
-      for (let i=0; i<ids.rows; i++){
-        const id = ids.intAt(i,0);
-        const idx = markerCfg.markers.findIndex(m => m.id === id);
-        if (idx<0) continue;
-        const c = corners.get(i);
-        const rvec = new cv.Mat(); const tvec = new cv.Mat();
-        cv.estimatePoseSingleMarkers(new cv.MatVector([c]), size, camMat, distCoeffs, new cv.MatVector([rvec]), new cv.MatVector([tvec]));
-        obs.push({ id, rvec, tvec, world: markerCfg.markers[idx] });
-        nMarkers++;
-      }
-
-      if (obs.length>0) {
-        // 用单个或多个标记融合相机位姿（这里先用“最佳一个”：离相机最近的那个）
-        obs.sort((a,b)=> {
-          const za = a.tvec.doubleAt(2,0), zb = b.tvec.doubleAt(2,0);
-          return za - zb;
-        });
-        const best = obs[0];
-        const RT_cam_from_marker = rtFromRvecTvec(best.rvec, best.tvec); // 相机 <- 标记
-        const RT_world_from_marker = worldFromMarker(best.world);        // 世界 <- 标记
-        // 相机 <- 世界 = (相机 <- 标记) ∘ (标记 <- 世界) = RT_cm ∘ inverse(RT_wm)
-        const RT_marker_from_world = new THREE.Matrix4().copy(RT_world_from_marker).invert();
-        const RT_cam_from_world = new THREE.Matrix4().multiplyMatrices(RT_cam_from_marker, RT_marker_from_world);
-        // worldGroup 要放到“世界 -> 相机”的逆，也就是“相机 -> 世界”
-        const RT_world_from_cam = new THREE.Matrix4().copy(RT_cam_from_world).invert();
-        worldGroup.matrix.copy(RT_world_from_cam);
-        havePose = true;
-
-        // 释放
-        obs.forEach(o=>{ o.rvec.delete(); o.tvec.delete(); });
-      }
-    }
-
-    // 更新箭头（放在相机前方 1m，朝向目标）
-    const arrowObj = arrow;
-    if (targetPos && havePose) {
-      arrowObj.visible = true;
-      // 相机在世界坐标：取 worldGroup.matrix 的逆 * 相机原点(0,0,0)
-      const camToWorld = new THREE.Matrix4().copy(worldGroup.matrix);
-      const worldToCam = new THREE.Matrix4().copy(camToWorld).invert();
-      const camW = new THREE.Vector3(0,0,0).applyMatrix4(camToWorld);
-      // 前方 1m（世界）
-      const forwardW = new THREE.Vector3(0,0,-1).applyMatrix4(new THREE.Matrix4().extractRotation(camToWorld)); // 摄像机 -Z 方向
-      const posW = camW.clone().addScaledVector(forwardW, 1.0);
-      // 放置
-      arrowObj.position.copy(posW);
-      // 朝向目标
-      const tgt = targetPos.clone();
-      arrowObj.lookAt(new THREE.Vector3(tgt.x, arrowObj.position.y, tgt.z));
+  // 我在这（点地面设起点）
+  let waitingHere=false;
+  btnHere.onclick = ()=>{ waitingHere=true; toast('点击地面 y=0 设“起点”'); };
+  window.addEventListener('pointerdown', (e)=>{
+    if (!waitingHere) return;
+    waitingHere = false;
+    pointer.x = (e.clientX/window.innerWidth)*2 - 1;
+    pointer.y = -(e.clientY/window.innerHeight)*2 + 1;
+    raycaster.setFromCamera(pointer, camera);
+    const hit = new THREE.Vector3();
+    if (raycaster.ray.intersectPlane(groundPlane, hit)) {
+      startPos = new THREE.Vector3(hit.x, 0, hit.z);
+      selS.value = ""; // 置空“起点房间”
+      updatePathAndHUD();
+      toast(`起点已设为 (${hit.x.toFixed(2)}, ${hit.z.toFixed(2)})`);
     } else {
-      arrowObj.visible = false;
+      toast('没有点到地面（y=0）');
     }
+  });
 
-    // 渲染
+  // 交换起终
+  btnSwap.onclick = ()=>{
+    const tmp = selS.value; selS.value = selE.value; selE.value = tmp;
+    applyRoomSelection();
+  };
+
+  // 朝向/高度微调（控制前方箭头的朝向与高度）
+  document.getElementById('yawMinus').onclick = ()=> userYawDeg -= 5;
+  document.getElementById('yawPlus').onclick  = ()=> userYawDeg += 5;
+  document.getElementById('hDown').onclick    = ()=> { userHeight=Math.max(0.8, userHeight-0.2); };
+  document.getElementById('hUp').onclick      = ()=> { userHeight=Math.min(3.0, userHeight+0.2); };
+
+  // 主循环
+  function animate(){
+    requestAnimationFrame(animate);
+    updateArrow();
     renderer.render(scene, camera);
-    hud.textContent = `markers: ${nMarkers} | pose: ${havePose?'OK':'N/A'}`;
-
-    // 清理
-    src.delete(); corners.delete(); ids.delete();
   }
-  loop();
+  animate();
 
-  // --------- 工具函数 ---------
+  // 自适应
+  window.addEventListener('resize', ()=>{
+    camera.aspect = window.innerWidth/window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight, false);
+  });
+
+  // —— 工具函数 —— //
+  function fetchMaybe(url){ return fetch(url).then(r=>r.ok?r:null).catch(()=>null); }
   function centroid(poly){
     if(!poly || poly.length<3) return [0,0];
     let x=0,y=0,a=0;
@@ -240,52 +196,35 @@
     if (Math.abs(a)<1e-9){ let sx=0,sy=0; for(const p of poly){sx+=p[0];sy+=p[1];} return [sx/poly.length, sy/poly.length]; }
     a*=0.5; x/=(6*a); y/=(6*a); return [x,y];
   }
-
-  function addRooms(parent, rooms){
-    const group = new THREE.Group();
+  function drawRooms(rs){
+    roomsGroup.clear();
     const lineMat = new THREE.LineBasicMaterial({color:0x00A2FF});
-    const fillMat = new THREE.MeshBasicMaterial({color:0x0066ff,transparent:true,opacity:.12,depthWrite:false});
-    rooms.forEach(r=>{
+    const fillMat = new THREE.MeshBasicMaterial({color:0x0066ff, transparent:true, opacity:.12, depthWrite:false});
+    rs.forEach(r=>{
       const up=0.02;
       const pts3 = r.poly.map(([x,y])=> new THREE.Vector3(x, up, y));
       const geoLine = new THREE.BufferGeometry().setFromPoints(pts3.concat([pts3[0]]));
-      group.add(new THREE.Line(geoLine, lineMat));
+      roomsGroup.add(new THREE.Line(geoLine, lineMat));
       const shapexz = new THREE.Shape(); r.poly.forEach(([x,y],k)=> k? shapexz.lineTo(x,y): shapexz.moveTo(x,y));
-      shapexz.autoClose=true;
+      shapexz.autoClose = true;
       const geo = new THREE.ShapeGeometry(shapexz);
       const mesh = new THREE.Mesh(geo, fillMat); mesh.rotation.x=-Math.PI/2; mesh.position.y=up;
-      group.add(mesh);
+      roomsGroup.add(mesh);
     });
-    parent.add(group);
   }
-
-  function makeBillboardArrow(){
-    const g = new THREE.PlaneGeometry(0.6,0.6);
-    const c = document.createElement('canvas'); c.width=256; c.height=256;
-    const ctx = c.getContext('2d');
-    ctx.strokeStyle='#fff'; ctx.lineWidth=16; ctx.lineCap='round'; ctx.lineJoin='round';
-    ctx.beginPath();
-    ctx.moveTo(128,32); ctx.lineTo(64,128); ctx.lineTo(104,128); ctx.lineTo(104,224);
-    ctx.lineTo(152,224); ctx.lineTo(152,128); ctx.lineTo(192,128); ctx.closePath(); ctx.stroke();
-    const tex = new THREE.CanvasTexture(c);
-    const m = new THREE.MeshBasicMaterial({map:tex, transparent:true, depthWrite:false});
-    const mesh = new THREE.Mesh(g,m);
-    return mesh;
-  }
-
-  function addPointCloud(parent, points){
+  function addPointCloud(points){
+    if (pcObj){ world.remove(pcObj); pcObj.geometry.dispose(); }
     const arr = new Float32Array(points.length*3);
     for(let i=0;i<points.length;i++){ arr[i*3]=points[i][0]; arr[i*3+1]=points[i][1]; arr[i*3+2]=points[i][2]; }
     const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(arr,3));
     const m = new THREE.PointsMaterial({color:0x00ff00, size:0.03, sizeAttenuation:true});
-    const cloud = new THREE.Points(g,m); parent.add(cloud);
+    pcObj = new THREE.Points(g,m); world.add(pcObj);
   }
-
   function parsePLY(buffer){
     const bytes = new Uint8Array(buffer);
-    let hEnd=-1, head=""; for(let i=0;i<bytes.length&&i<1e6;i++){ head+=String.fromCharCode(bytes[i]); if(head.includes("end_header\n")){ hEnd=i+1; break; } }
-    if(hEnd<0) return [];
-    const lines = head.split(/\r?\n/);
+    let hEnd=-1, header=""; for(let i=0;i<bytes.length&&i<1e6;i++){ header+=String.fromCharCode(bytes[i]); if(header.includes("end_header\n")){ hEnd=i+1; break; } }
+    if (hEnd<0) return [];
+    const lines = header.split(/\r?\n/);
     let n=0,isBin=false,little=true; const props=[];
     for(const Lraw of lines){
       const L=Lraw.trim().toLowerCase();
@@ -321,64 +260,51 @@
       return pts;
     }
   }
-
-  function cvReady(){
-    return new Promise(res=>{
-      if (window.cv && cv.getBuildInformation) return res();
-      document.addEventListener('opencvready', res);
-    });
+  function fitView(points){
+    let minX=Infinity,minY=Infinity,minZ=Infinity,maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;
+    for(const p of points){ const [x,y,z]=p; if(x<minX)minX=x; if(y<minY)minY=y; if(z<minZ)minZ=z; if(x>maxX)maxX=x; if(y>maxY)maxY=y; if(z>maxZ)maxZ=z; }
+    const cx=(minX+maxX)/2, cy=(minY+maxY)/2, cz=(minZ+maxZ)/2; const span=Math.max(maxX-minX,maxY-minY,maxZ-minZ);
+    camera.position.set(cx, cy+span*0.2, cz+span*1.2); camera.lookAt(cx,cy,cz);
   }
-
-  function getArucoDict(name){
-    // 仅列常用的：4x4_50 / 5x5_100 / 6x6_250 等
-    const map = {
-      'DICT_4X4_50': cv.DICT_4X4_50,
-      'DICT_5X5_100': cv.DICT_5X5_100,
-      'DICT_6X6_250': cv.DICT_6X6_250,
-      'DICT_7X7_1000': cv.DICT_7X7_1000
-    };
-    const key = map[name] || cv.DICT_4X_4_50 || cv.DICT_4X4_50;
-    return new cv.Dictionary(key);
+  function makeArrow(){
+    const g = new THREE.PlaneGeometry(0.6,0.6);
+    const c = document.createElement('canvas'); c.width=256; c.height=256;
+    const ctx = c.getContext('2d');
+    ctx.strokeStyle='#fff'; ctx.lineWidth=16; ctx.lineCap='round'; ctx.lineJoin='round';
+    ctx.beginPath();
+    ctx.moveTo(128,32); ctx.lineTo(64,128); ctx.lineTo(104,128); ctx.lineTo(104,224);
+    ctx.lineTo(152,224); ctx.lineTo(152,128); ctx.lineTo(192,128); ctx.closePath(); ctx.stroke();
+    const tex = new THREE.CanvasTexture(c);
+    const m = new THREE.MeshBasicMaterial({map:tex, transparent:true, depthWrite:false});
+    return new THREE.Mesh(g,m);
   }
-
-  function cameraMatrixFromFOV(w,h,fovDeg){
-    const f = 0.5*h / Math.tan((fovDeg*Math.PI/180)/2);
-    const K = cv.Mat.eye(3,3,cv.CV_64F);
-    K.doublePtr(0,0)[0] = f; // fx
-    K.doublePtr(1,1)[0] = f; // fy
-    K.doublePtr(0,2)[0] = w/2; // cx
-    K.doublePtr(1,2)[0] = h/2; // cy
-    return K;
+  function updatePathAndHUD(){
+    // 路径线
+    const geo = new THREE.BufferGeometry();
+    const pts = [];
+    if (startPos) pts.push(new THREE.Vector3(startPos.x, 0.05, startPos.z));
+    if (endPos)   pts.push(new THREE.Vector3(endPos.x,   0.05, endPos.z));
+    if (pts.length>=2){ geo.setFromPoints(pts); pathLine.geometry.dispose(); pathLine.geometry = geo; pathLine.computeLineDistances(); }
+    else { geo.setFromPoints([]); pathLine.geometry.dispose(); pathLine.geometry = geo; }
+    // HUD
+    let dist = '—';
+    if (startPos && endPos) dist = startPos.clone().setY(0).distanceTo(endPos.clone().setY(0)).toFixed(2);
+    hud.innerHTML = `起点: ${startPos?`${startPos.x.toFixed(2)},${startPos.z.toFixed(2)}`:'N/A'} → 终点: ${endPos?`${endPos.x.toFixed(2)},${endPos.z.toFixed(2)}`:'N/A'}<br>距离: ${dist} m`;
+    // 箭头显示
+    arrow.visible = !!endPos;
   }
-
-  function rtFromRvecTvec(rvec, tvec){
-    // OpenCV rvec/tvec -> THREE Matrix4
-    const R = new cv.Mat();
-    cv.Rodrigues(rvec, R);
-    const m = new THREE.Matrix4();
-    const e = m.elements;
-    // OpenCV 是列主序 3x3，这里手填
-    e[0]=R.doubleAt(0,0); e[4]=R.doubleAt(0,1); e[8] =R.doubleAt(0,2); e[12]=tvec.doubleAt(0,0);
-    e[1]=R.doubleAt(1,0); e[5]=R.doubleAt(1,1); e[9] =R.doubleAt(1,2); e[13]=tvec.doubleAt(1,0);
-    e[2]=R.doubleAt(2,0); e[6]=R.doubleAt(2,1); e[10]=R.doubleAt(2,2); e[14]=tvec.doubleAt(2,0);
-    e[3]=0; e[7]=0; e[11]=0; e[15]=1;
-    R.delete();
-    return m;
+  function updateArrow(){
+    if (!endPos || !arrow.visible) return;
+    // 箭头放在“相机前方 1m，高度 userHeight”，方向指向终点（纯演示：用手动 yaw 来决定“前方”）
+    const yaw = THREE.MathUtils.degToRad(userYawDeg);
+    // 相机位（用Three摄像机位置，不跟随真实世界）
+    const camPos = camera.position.clone();
+    const forward = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
+    const pos = camPos.clone().addScaledVector(forward, 1.0); pos.y = userHeight;
+    arrow.position.copy(pos);
+    const target = new THREE.Vector3(endPos.x, pos.y, endPos.z);
+    arrow.lookAt(target);
   }
-
-  function worldFromMarker(m){
-    // 已知“标记在世界坐标”的位姿：pos=[x,y,z], yaw_deg（绕+Y）
-    const T = new THREE.Matrix4().makeTranslation(m.pos[0], m.pos[1], m.pos[2]);
-    const R = new THREE.Matrix4().makeRotationY(m.yaw_deg ? m.yaw_deg*Math.PI/180 : 0);
-    return new THREE.Matrix4().multiplyMatrices(T, R);
-  }
-
-  // 自适应画布
-  window.addEventListener('resize', ()=>{
-    camera.aspect = window.innerWidth / window.innerHeight;
-    camera.updateProjectionMatrix();
-    renderer.setSize(window.innerWidth, window.innerHeight, false);
-  });
 })();
 </script>
 </body>
