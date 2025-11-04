@@ -146,9 +146,12 @@ button:disabled {
 }
 
 #arrow {
-  font-size: 5rem;
+  /* 用大号等宽字体显示 -> 箭头，更明显 */
+  font-size: 4.5rem;
+  font-family: "Menlo", "SF Mono", "Consolas", monospace;
+  font-weight: 700;
   text-shadow: 0 0 12px rgba(0, 0, 0, 0.7);
-  transform-origin: 50% 55%;
+  transform-origin: 50% 50%;
 }
 
 #ar-status {
