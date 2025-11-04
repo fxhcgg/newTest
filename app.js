@@ -8,7 +8,7 @@ let selectedRoomId = null;
 let startPos = null; // {x, y} in floor image px
 let destPos = null;  // {x, y} centroid of room polygon
 
-let headingDeg = null; // 来自 DeviceOrientation / webkitCompassHeading
+let headingDeg = null; // 设备朝向（0 = 北）
 
 // ------- 初始化 -------
 window.addEventListener("DOMContentLoaded", () => {
@@ -24,24 +24,19 @@ window.addEventListener("DOMContentLoaded", () => {
   setupARButton();
 });
 
-// ------- 加载本地静态资源（无文件选择器） -------
+// ------- 加载静态资源 -------
 async function loadAssets() {
-  // 预加载平面图
   floorImg = await loadImage("Floor6.png");
 
-  // canvas 尺寸与图片一致，坐标好算
   canvas.width = floorImg.width;
   canvas.height = floorImg.height;
 
-  // 加载房间多边形
   const roomsData = await fetch("./rooms_manual.json").then((r) => r.json());
   rooms = roomsData.rooms || roomsData;
 
-  // 加载 world -> floor 仿射参数
   worldParams = await fetch("./world_to_floor_params.json").then((r) => r.json());
 }
 
-// 简单图片加载 Promise
 function loadImage(src) {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -51,7 +46,7 @@ function loadImage(src) {
   });
 }
 
-// ------- UI 初始化 -------
+// ------- UI -------
 function setupUI() {
   const destSelect = document.getElementById("dest-room");
   destSelect.innerHTML = "";
@@ -75,12 +70,10 @@ function setupUI() {
     drawFloor();
   });
 
-  // 点击画布设置当前位置
   canvas.addEventListener("click", (evt) => {
     const rect = canvas.getBoundingClientRect();
     const scaleX = canvas.width / rect.width;
     const scaleY = canvas.height / rect.height;
-
     const x = (evt.clientX - rect.left) * scaleX;
     const y = (evt.clientY - rect.top) * scaleY;
 
@@ -93,21 +86,18 @@ function setupUI() {
   });
 }
 
-// ------- 平面图绘制 -------
+// ------- 绘制平面图 -------
 function drawFloor() {
   if (!floorImg) return;
-
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(floorImg, 0, 0);
 
-  // 画所有房间边界
   ctx.lineWidth = 2;
   rooms.forEach((room) => {
     const pts = room.points;
     if (!pts || pts.length === 0) return;
 
     const isSelected = room.id === selectedRoomId;
-
     ctx.beginPath();
     pts.forEach((p, idx) => {
       const [x, y] = p;
@@ -126,7 +116,6 @@ function drawFloor() {
     ctx.stroke();
   });
 
-  // 当前点位置
   if (startPos) {
     ctx.beginPath();
     ctx.arc(startPos.x, startPos.y, 6, 0, Math.PI * 2);
@@ -137,7 +126,6 @@ function drawFloor() {
     ctx.stroke();
   }
 
-  // 目标房间中心
   if (destPos) {
     ctx.beginPath();
     ctx.arc(destPos.x, destPos.y, 5, 0, Math.PI * 2);
@@ -146,7 +134,6 @@ function drawFloor() {
   }
 }
 
-// 多边形质心（简单平均）
 function getRoomCentroid(room) {
   const pts = room.points;
   let sx = 0,
@@ -155,13 +142,10 @@ function getRoomCentroid(room) {
     sx += x;
     sy += y;
   });
-  return {
-    x: sx / pts.length,
-    y: sy / pts.length,
-  };
+  return { x: sx / pts.length, y: sy / pts.length };
 }
 
-// ------- Tab 切换 -------
+// ------- Tabs -------
 function setupTabs() {
   const buttons = document.querySelectorAll(".tab-button");
   const contents = document.querySelectorAll(".tab-content");
@@ -169,7 +153,6 @@ function setupTabs() {
   buttons.forEach((btn) => {
     btn.addEventListener("click", () => {
       const tabId = btn.dataset.tab;
-
       buttons.forEach((b) => b.classList.toggle("active", b === btn));
       contents.forEach((c) =>
         c.classList.toggle("active", c.id === tabId)
@@ -178,19 +161,20 @@ function setupTabs() {
   });
 }
 
-// ------- AR 相关 -------
+// ------- AR 主流程 -------
 function setupARButton() {
-  const btn = document.getElementById("start-ar");
-  btn.addEventListener("click", startAR);
+  document.getElementById("start-ar").addEventListener("click", startAR);
 }
 
 async function startAR() {
+  const statusEl = document.getElementById("ar-status");
+
   if (!startPos || !destPos) {
     alert("请先在平面图上点击设置当前位置，并选择目标房间。");
     return;
   }
 
-  // 打开 AR tab
+  // 切换到 AR tab
   document
     .querySelectorAll(".tab-button")
     .forEach((b) => b.classList.toggle("active", b.dataset.tab === "ar-tab"));
@@ -198,10 +182,8 @@ async function startAR() {
     .querySelectorAll(".tab-content")
     .forEach((c) => c.classList.toggle("active", c.id === "ar-tab"));
 
-  const statusEl = document.getElementById("ar-status");
+  // 打开摄像头
   const video = document.getElementById("camera");
-
-  // 摄像头
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: "environment" } },
@@ -209,19 +191,128 @@ async function startAR() {
     });
     video.srcObject = stream;
   } catch (err) {
-    console.error(err);
+    console.error("getUserMedia error", err);
     statusEl.textContent = "无法打开摄像头：" + err.message;
   }
 
-  // 方向传感器
+  // 初始化方向传感器
   try {
     await initOrientationSensor();
     statusEl.textContent = "传感器已开启，按照箭头方向前进。";
   } catch (e) {
-    console.error(e);
+    console.error("initOrientationSensor error", e);
     statusEl.textContent = e.message || "方向传感器不可用。";
   }
 }
 
-// 初始化 DeviceOrientation（兼容 iOS / Android）
-async func
+// ------- 方向传感器初始化（iOS & Android） -------
+async function initOrientationSensor() {
+  if (typeof DeviceOrientationEvent === "undefined") {
+    throw new Error("当前浏览器不支持方向传感器（DeviceOrientation）。");
+  }
+
+  // iOS / iPadOS 13+ & iOS 上的 Chrome 都会有这个方法
+  if (typeof DeviceOrientationEvent.requestPermission === "function") {
+    try {
+      const res = await DeviceOrientationEvent.requestPermission();
+      if (res !== "granted") {
+        throw new Error(
+          "已拒绝方向传感器权限。请在 iOS 设置和 Safari 网站设置中允许“运动与方向访问”。"
+        );
+      }
+    } catch (err) {
+      // 即便出错，也尝试继续监听，有些环境会返回错误但仍然能触发事件
+      console.warn("requestPermission 出错：", err);
+      window.addEventListener("deviceorientation", handleOrientation, true);
+      throw new Error(
+        "请求方向传感器权限失败，请检查：\n1. 使用 https 页面\n2. iOS 设置中开启“运动与方向访问”\n3. Safari 网站设置允许传感器。"
+      );
+    }
+  }
+
+  // 优先使用 absolute 事件
+  if ("ondeviceorientationabsolute" in window) {
+    window.addEventListener(
+      "deviceorientationabsolute",
+      handleOrientation,
+      true
+    );
+  } else {
+    window.addEventListener("deviceorientation", handleOrientation, true);
+  }
+}
+
+// ------- 处理方向事件 -------
+function handleOrientation(evt) {
+  const statusEl = document.getElementById("ar-status");
+  let heading;
+
+  // iOS: webkitCompassHeading 是已经校正了磁北的角度
+  if (typeof evt.webkitCompassHeading === "number") {
+    heading = evt.webkitCompassHeading;
+  } else if (evt.absolute && typeof evt.alpha === "number") {
+    // 部分 Android: alpha = 绝对方位角
+    heading = evt.alpha;
+  } else if (typeof evt.alpha === "number") {
+    // 最后退路：alpha，相对方位角（可能不精确）
+    heading = evt.alpha;
+  } else {
+    statusEl.textContent =
+      "方向数据不可用，请确认已授权传感器，并尝试晃动手机进行校准。";
+    return;
+  }
+
+  headingDeg = heading;
+  updateArrow();
+}
+
+// ------- 更新箭头 -------
+function updateArrow() {
+  const arrowEl = document.getElementById("arrow");
+  const statusEl = document.getElementById("ar-status");
+
+  if (!startPos || !destPos) {
+    statusEl.textContent = "请先在平面图上设置当前位置与目标。";
+    return;
+  }
+  if (headingDeg == null) {
+    statusEl.textContent = "正在读取方向传感器…";
+    return;
+  }
+
+  const dx = destPos.x - startPos.x;
+  const dy = destPos.y - startPos.y;
+
+  // 画布坐标 y 向下，所以用 -dy，让上方当作“北”
+  const bearingRad = Math.atan2(dx, -dy);
+  let bearingDeg = (bearingRad * 180) / Math.PI;
+  if (bearingDeg < 0) bearingDeg += 360;
+
+  // 相对角度（让箭头指向目的地）
+  let rel = bearingDeg - headingDeg;
+  rel = ((rel + 540) % 360) - 180; // 归一化到 [-180, 180]
+
+  arrowEl.style.transform = `translate(-50%, -50%) rotate(${rel}deg)`;
+
+  const distancePx = Math.hypot(dx, dy);
+  let distanceText = "";
+  if (worldParams && worldParams.meters_per_floor_px) {
+    const meters = distancePx * worldParams.meters_per_floor_px;
+    distanceText = `，约 ${meters.toFixed(1)} m`;
+  }
+
+  statusEl.textContent = `朝箭头方向前进${distanceText}`;
+}
+
+// ------- world -> floor 工具（备用） -------
+function worldToFloor(x, y, z) {
+  if (!worldParams || !worldParams.affine_M_2x3) {
+    throw new Error("world_to_floor_params 未加载");
+  }
+  const M = worldParams.affine_M_2x3;
+  const u = x; // FRONT_XZ：用 X,Z
+  const v = z;
+  const px = M[0][0] * u + M[0][1] * v + M[0][2];
+  const py = M[1][0] * u + M[1][1] * v + M[1][2];
+  return { x: px, y: py };
+}
