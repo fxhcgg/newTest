@@ -8,7 +8,7 @@ let selectedRoomId = null;
 let startPos = null; // {x, y} in floor image px
 let destPos = null;  // {x, y} centroid of room polygon
 
-let headingDeg = null; // 设备朝向（0 = 北）
+let headingDeg = null;           // 设备朝向（0 = 北）
 let orientationListening = false; // 防止重复注册监听
 
 // ------- 初始化 -------
@@ -179,7 +179,7 @@ async function onStartARClick() {
     return;
   }
 
-  // 先切换到 AR tab（同步操作，不影响权限弹窗）
+  // 切换到 AR tab（同步操作，不影响权限弹窗）
   document
     .querySelectorAll(".tab-button")
     .forEach((b) => b.classList.toggle("active", b.dataset.tab === "ar-tab"));
@@ -189,10 +189,8 @@ async function onStartARClick() {
 
   // -------- 1. 请求方向传感器权限（iOS 13+ 必须在点击回调里直接调用） --------
   let sensorSupported = typeof DeviceOrientationEvent !== "undefined";
-  let sensorPermissionOk = true;
 
   if (!sensorSupported) {
-    sensorPermissionOk = false;
     statusEl.textContent = "当前浏览器不支持 DeviceOrientation 方向传感器。";
   } else if (
     typeof DeviceOrientationEvent.requestPermission === "function"
@@ -201,19 +199,17 @@ async function onStartARClick() {
     try {
       const res = await DeviceOrientationEvent.requestPermission();
       if (res !== "granted") {
-        sensorPermissionOk = false;
         statusEl.textContent =
           "已拒绝方向传感器权限，请在 Safari 网站设置中允许“运动与方向访问”。";
+        // 不 return，让后面至少还能用摄像头 + 平面图
       }
     } catch (e) {
       console.warn("DeviceOrientationEvent.requestPermission error:", e);
-      sensorPermissionOk = false;
       statusEl.textContent =
         "请求方向传感器权限失败，请确认使用 Safari 且允许“运动与方向访问”。";
     }
   } else {
-    // 没有 requestPermission（Android / 老版本 iOS），后面直接监听事件即可
-    sensorPermissionOk = true;
+    // 没有 requestPermission（Android / 老版本 iOS）：后面直接监听事件即可
   }
 
   // -------- 2. 打开摄像头 --------
@@ -232,7 +228,7 @@ async function onStartARClick() {
   // -------- 3. 注册方向事件监听 --------
   if (sensorSupported) {
     startOrientationListener();
-    // 简单做一个 3 秒检测：如果 3 秒后还没有任何 heading 数据，就提示可能被系统禁用
+    // 3 秒检测：如果 3 秒后还没有任何 heading 数据，就提示可能被系统禁用
     headingDeg = null;
     setTimeout(() => {
       if (headingDeg == null) {
@@ -311,7 +307,10 @@ function updateArrow() {
   // 归一化到 [-180, 180]
   rel = ((rel + 540) % 360) - 180;
 
-  arrowEl.style.transform = `translate(-50%, -50%) rotate(${rel}deg)`;
+  // 注意：-> 默认是“向右”的，所以这里 +90°，让“rel = 0”时箭头朝上
+  const visualDeg = rel + 90;
+
+  arrowEl.style.transform = `translate(-50%, -50%) rotate(${visualDeg}deg)`;
 
   const distancePx = Math.hypot(dx, dy);
   let distanceText = "";
